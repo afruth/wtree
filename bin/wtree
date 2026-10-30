@@ -19,10 +19,11 @@ usage: wtree       search the worktrees of this repo
                 ctrl-f: delete with volumes, ctrl-r: reload
 
 On screens narrower than 60 columns, enter or a tap opens a menu of these actions.
-In Rex and tmux, opening a worktree that is already open jumps to its tab.
+Opening a worktree that is already open jumps to its tab.
 A deleted worktree offers to delete its stacks, and a deleted stack offers to delete its worktree.
 The ../worktrees directory is beside the main checkout. Needs git and fzf, and docker for -d.
-Opens a tab in Rex, tmux, WezTerm, and iTerm2. Other terminals get the path.
+Opens or jumps to a tab in Rex, herdr, cmux, tmux, zellij, WezTerm, kitty, Ghostty, iTerm2, and Terminal.
+Other terminals get the path.
 EOF
 }
 
@@ -143,8 +144,30 @@ list_worktrees() {
     }' | tr '\n\037' '\0\n'
 }
 
-rex_cmd() {
-  "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" "$@"
+terminal_kind() {
+  local program=${TERM_PROGRAM:-}
+  if [[ $program == herdr ]]; then
+    printf 'herdr'
+  elif [[ -n ${ZELLIJ:-} ]]; then
+    printf 'zellij'
+  elif [[ $program == tmux || (-n ${TMUX:-} && $program != rex) ]]; then
+    printf 'tmux'
+  elif [[ $program == rex ]]; then
+    printf 'rex'
+  elif [[ -n ${CMUX_WORKSPACE_ID:-} ]]; then
+    printf 'cmux'
+  elif [[ -n ${WEZTERM_PANE:-} ]]; then
+    printf 'wezterm'
+  elif [[ -n ${KITTY_WINDOW_ID:-} ]]; then
+    printf 'kitty'
+  else
+    case $program in
+      ghostty) printf 'ghostty' ;;
+      iTerm.app) printf 'iterm' ;;
+      Apple_Terminal) printf 'terminal' ;;
+      *) if [[ -n ${REX_SESSION:-} ]]; then printf 'rex'; else printf 'unknown'; fi ;;
+    esac
+  fi
 }
 
 in_target() {
@@ -152,6 +175,17 @@ in_target() {
   [[ $cwd == "$target" || $cwd == "$target"/* ]] || return 1
   owner=$(worktree_of "$cwd")
   [[ -z $owner || $owner == "$target" ]]
+}
+
+tty_cwd() {
+  local pid
+  pid=$(ps -t "${1#/dev/}" -o pid=,stat= | awk '$2 ~ /\+/ { pid = $1 } END { print pid }')
+  [[ -n $pid ]] || return 1
+  lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+}
+
+rex_cmd() {
+  "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" "$@"
 }
 
 # the app keeps its own visible tab, so focusing the block on the server does not move the screen
@@ -174,7 +208,7 @@ rex_focus_existing() {
   sessions=$(rex_cmd api call session.list | grep -oE '"session_id": *"[^"]*"' | cut -d'"' -f4 | grep -Fxv "$REX_SESSION") || sessions=
   for session in "$REX_SESSION" $sessions; do
     while read -r block window; do
-      [[ $block != "$REX_BLOCK" ]] || continue
+      [[ $block != "${REX_BLOCK:-}" ]] || continue
       cwd=$(rex_cmd api call -s "$session" com.superlogical.terminal.process "{\"block_id\":\"$block\"}" 2>/dev/null |
         sed -n 's/.*"foreground": *{\([^}]*\)}.*/\1/p' | grep -oE '"cwd": *"[^"]*"' | cut -d'"' -f4) || continue
       in_target "$cwd" "$target" || continue
@@ -185,6 +219,10 @@ rex_focus_existing() {
       awk -F'"' '$2 == "block_id" { block = $4 } $2 == "window_id" { print block, $4 }')
   done
   return 1
+}
+
+rex_new_tab() {
+  rex_cmd window new --cwd "$1" "$(basename "$1")" >/dev/null
 }
 
 tmux_focus_existing() {
@@ -200,44 +238,259 @@ tmux_focus_existing() {
   return 1
 }
 
-focus_existing() {
-  local target=$1
-  if [[ -n ${TMUX:-} ]]; then
-    tmux_focus_existing "$target"
-  elif [[ -n ${REX_SESSION:-} ]]; then
-    rex_focus_existing "$target"
-  else
+tmux_new_tab() {
+  tmux new-window -c "$1" -n "$(basename "$1")"
+}
+
+herdr_focus_existing() {
+  local target=$1 pane tab cwd
+  while IFS=$'\t' read -r pane tab cwd; do
+    [[ $pane != "${HERDR_PANE_ID:-}" ]] || continue
+    in_target "$cwd" "$target" || continue
+    herdr workspace focus "${tab%%:*}" >/dev/null
+    herdr tab focus "$tab" >/dev/null
+    return 0
+  done < <(herdr pane list | grep -oE '"(foreground_cwd|pane_id|tab_id)":"[^"]*"' |
+    awk -F'"' '$2 == "foreground_cwd" { cwd = $4 } $2 == "pane_id" { pane = $4 } $2 == "tab_id" { print pane "\t" $4 "\t" cwd }')
+  return 1
+}
+
+herdr_new_tab() {
+  herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$1" --label "$(basename "$1")" --focus >/dev/null
+}
+
+zellij_focus_existing() {
+  local target=$1 pane cwd
+  while IFS=$'\t' read -r pane cwd; do
+    [[ $pane != "${ZELLIJ_PANE_ID:-}" ]] || continue
+    in_target "$cwd" "$target" || continue
+    zellij action focus-pane-id "terminal_$pane" >/dev/null
+    return 0
+  done < <(zellij action list-panes --json | tr -d '\n' | sed 's/},  *{/}\n{/g' | awk '
+    /"is_plugin": *false/ {
+      id = $0; sub(/.*"id": */, "", id); sub(/[^0-9].*/, "", id)
+      cwd = $0; if (!sub(/.*"pane_cwd": *"/, "", cwd)) next
+      sub(/".*/, "", cwd)
+      print id "\t" cwd
+    }')
+  return 1
+}
+
+zellij_new_tab() {
+  zellij action new-tab --cwd "$1" --name "$(basename "$1")" >/dev/null
+}
+
+cmux_cmd() {
+  "${CMUX_BUNDLED_CLI_PATH:-cmux}" "$@"
+}
+
+cmux_focus_existing() {
+  local target=$1 workspace cwd
+  while read -r workspace; do
+    [[ $workspace != "${CMUX_WORKSPACE_ID:-}" ]] || continue
+    while read -r cwd; do
+      in_target "$cwd" "$target" || continue
+      cmux_cmd select-workspace --workspace "$workspace" >/dev/null
+      return 0
+    done < <(cmux_cmd sidebar-state --workspace "$workspace" | sed -nE 's/^[[:space:]]*"?cwd"?[=:][[:space:]]*"?([^"]*)"?,?[[:space:]]*$/\1/p')
+  done < <(cmux_cmd list-workspaces | grep -oE 'workspace:[0-9]+')
+  return 1
+}
+
+cmux_new_tab() {
+  cmux_cmd new-workspace --cwd "$1" --name "$(basename "$1")" >/dev/null
+}
+
+wezterm_cmd() {
+  "${WEZTERM_EXECUTABLE_DIR:+$WEZTERM_EXECUTABLE_DIR/}wezterm" "$@"
+}
+
+wezterm_focus_existing() {
+  local target=$1 pane cwd
+  while IFS=$'\t' read -r pane cwd; do
+    [[ $pane != "${WEZTERM_PANE:-}" ]] || continue
+    in_target "$cwd" "$target" || continue
+    wezterm_cmd cli activate-pane --pane-id "$pane"
+    return 0
+  done < <(wezterm_cmd cli list --format json | awk '
+    /"pane_id":/ { pane = $0; gsub(/[^0-9]/, "", pane) }
+    /"cwd":/ {
+      cwd = $0; sub(/.*"cwd": *"file:\/\/[^\/]*/, "", cwd); sub(/".*/, "", cwd); gsub(/%20/, " ", cwd)
+      print pane "\t" cwd
+    }')
+  return 1
+}
+
+wezterm_new_tab() {
+  wezterm_cmd cli spawn --cwd "$1" >/dev/null
+}
+
+kitty_focus_existing() {
+  local escaped
+  escaped=$(printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g')
+  kitten @ focus-window --match "cwd:\"^$escaped\$\" or cwd:\"^$escaped/\"" >/dev/null
+}
+
+kitty_new_tab() {
+  if ! kitten @ launch --type=tab --cwd="$1" --tab-title="$(basename "$1")" >/dev/null; then
+    printf 'wtree: set allow_remote_control in kitty.conf to open tabs\n' >&2
     return 1
   fi
 }
 
-open_tab() {
-  local dir=$1 target
-  [[ -d $dir ]] || die "the directory does not exist: $dir"
-  target=$(worktree_of "$dir")
-  target=${target:-$dir}
-  if [[ -n ${TMUX:-} || -n ${REX_SESSION:-} ]] && in_target "$PWD" "$target"; then
-    printf 'wtree: you are already in %s\n' "$target" >&2
-    return 0
-  fi
-  if focus_existing "$target"; then return 0; fi
-  if [[ -n ${TMUX:-} ]]; then
-    tmux new-window -c "$dir" -n "$(basename "$dir")"
-  elif [[ -n ${REX_SESSION:-} ]]; then
-    "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" window new --cwd "$dir" "$(basename "$dir")" >/dev/null
-  elif [[ -n ${WEZTERM_PANE:-} ]]; then
-    wezterm cli spawn --cwd "$dir" >/dev/null
-  elif [[ ${TERM_PROGRAM:-} == iTerm.app ]]; then
-    osascript - "$dir" >/dev/null <<'EOF'
+ghostty_focus_existing() {
+  [[ $(osascript - "$1" 2>/dev/null <<'EOF'
 on run argv
-  tell application "iTerm2" to tell current window
-    set newTab to (create tab with default profile)
-    tell current session of newTab to write text "cd " & quoted form of (item 1 of argv)
+  set target to item 1 of argv
+  tell application "Ghostty"
+    repeat with t in terminals
+      set d to working directory of t
+      if d is target or d starts with (target & "/") then
+        focus t
+        return "found"
+      end if
+    end repeat
+  end tell
+  return ""
+end run
+EOF
+) == found ]]
+}
+
+ghostty_new_tab() {
+  osascript - "$1" >/dev/null <<'EOF'
+on run argv
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set initial working directory of cfg to item 1 of argv
+    new tab in front window with configuration cfg
   end tell
 end run
 EOF
-  else
+}
+
+iterm_focus_existing() {
+  local target=$1 id tty cwd
+  while IFS=$'\t' read -r id tty; do
+    cwd=$(tty_cwd "$tty") || continue
+    in_target "$cwd" "$target" || continue
+    osascript - "$id" >/dev/null <<'EOF'
+on run argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if id of s is item 1 of argv then
+            select w
+            select t
+            select s
+            activate
+            return
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+end run
+EOF
+    return 0
+  done < <(osascript <<'EOF'
+set out to ""
+set sep to tab
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        set out to out & (id of s) & sep & (tty of s) & linefeed
+      end repeat
+    end repeat
+  end repeat
+end tell
+return out
+EOF
+  )
+  return 1
+}
+
+iterm_new_tab() {
+  osascript - "$1" >/dev/null <<'EOF'
+on run argv
+  tell application "iTerm2"
+    tell current window
+      set newTab to (create tab with default profile)
+      tell current session of newTab to write text "cd " & quoted form of (item 1 of argv)
+    end tell
+  end tell
+end run
+EOF
+}
+
+terminal_focus_existing() {
+  local target=$1 win index tty cwd
+  while IFS=$'\t' read -r win index tty; do
+    cwd=$(tty_cwd "$tty") || continue
+    in_target "$cwd" "$target" || continue
+    osascript - "$win" "$index" >/dev/null <<'EOF'
+on run argv
+  tell application "Terminal"
+    set w to window id ((item 1 of argv) as integer)
+    set selected of tab ((item 2 of argv) as integer) of w to true
+    set frontmost of w to true
+    activate
+  end tell
+end run
+EOF
+    return 0
+  done < <(osascript <<'EOF'
+set out to ""
+set sep to tab
+tell application "Terminal"
+  repeat with w in windows
+    repeat with i from 1 to count of tabs of w
+      set out to out & (id of w) & sep & i & sep & (tty of tab i of w) & linefeed
+    end repeat
+  end repeat
+end tell
+return out
+EOF
+  )
+  return 1
+}
+
+# Terminal has no scripting call for a new tab: the shortcut needs Accessibility, else open a window
+terminal_new_tab() {
+  osascript - "$1" >/dev/null 2>&1 <<'EOF'
+on run argv
+  set command to "cd " & quoted form of (item 1 of argv)
+  tell application "Terminal" to activate
+  try
+    tell application "System Events" to keystroke "t" using command down
+    delay 0.3
+    tell application "Terminal" to do script command in selected tab of front window
+  on error
+    tell application "Terminal" to do script command
+  end try
+end run
+EOF
+}
+
+open_tab() {
+  local dir=$1 kind target
+  [[ -d $dir ]] || die "the directory does not exist: $dir"
+  kind=$(terminal_kind)
+  if [[ $kind == unknown ]]; then
     printf 'wtree: this terminal has no tab support, open this directory: %s\n' "$dir" >&2
+    return 0
+  fi
+  target=$(worktree_of "$dir")
+  target=${target:-$dir}
+  if in_target "$PWD" "$target"; then
+    printf 'wtree: you are already in %s\n' "$target" >&2
+    return 0
+  fi
+  if "${kind}_focus_existing" "$target" 2>/dev/null; then return 0; fi
+  if ! "${kind}_new_tab" "$dir"; then
+    printf 'wtree: could not open a tab in %s, open this directory: %s\n' "$kind" "$dir" >&2
   fi
 }
 

@@ -75,13 +75,23 @@ Below 60 columns, each entry uses more lines, and long paths lose their start. `
 
 ## Tabs
 
-| Terminal | New tab | Jump to an open tab |
-| - | - | - |
-| Rex | Yes | Yes, with Remote Control on |
-| tmux | Yes | Yes |
-| WezTerm | Yes | No |
-| iTerm2 | Yes | No |
-| Other terminals | No, `wtree` prints the path | No |
+`wtree` finds the terminal that it runs in. It opens a tab in that terminal, or jumps to a tab that already has the worktree open. If you are already in that worktree, `wtree` tells you and opens nothing.
+
+| Terminal | New tab | Jump to an open tab | You must set |
+| - | - | - | - |
+| Rex | Yes | Yes | Remote Control on |
+| herdr | Yes | Yes, across workspaces | - |
+| cmux | Yes, a new workspace | Yes, across workspaces | - |
+| tmux | Yes | Yes | - |
+| zellij | Yes | Yes, zellij 0.44 or later | - |
+| WezTerm | Yes | Yes | - |
+| kitty | Yes | Yes | `allow_remote_control yes` in `kitty.conf` |
+| Ghostty on macOS | Yes | Yes | Ghostty 1.3 or later, and the macOS Automation permission |
+| iTerm2 | Yes | Yes | The macOS Automation permission |
+| Terminal on macOS | Yes, with the macOS Accessibility permission, else a new window | Yes | The macOS Automation permission |
+| Other terminals | No, `wtree` prints the path | No | - |
+
+A multiplexer takes priority over the terminal that it runs in. For example, `wtree` in tmux in Ghostty opens a tmux window.
 
 ## Rex plugin
 
