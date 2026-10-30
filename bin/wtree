@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ADJECTIVES=(amber brisk calm crisp dusty eager fuzzy gentle golden hollow icy jolly keen lively mellow misty nimble oaken quiet rapid rosy rustic silver sleek stormy sunny swift tidal velvet witty)
+NOUNS=(anchor badger brook canyon cedar comet delta ember falcon fern glacier harbor heron island juniper lagoon lantern maple meadow otter pebble quartz raven reef ridge sparrow thicket tundra valley willow)
+
+die() {
+  printf 'wtree: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+usage: wtree       search the worktrees of this repo
+                enter: open, ctrl-d: delete, ctrl-f: force delete
+       wtree -n    create a worktree at the current HEAD in ../worktrees and open it
+       wtree -d    search the Docker Compose stacks of this repo and its worktrees, with usage
+                enter: open, ctrl-s: stop, ctrl-d: delete and keep volumes,
+                ctrl-f: delete with volumes, ctrl-r: reload
+
+On screens narrower than 60 columns, enter or a tap opens a menu of these actions.
+In Rex and tmux, opening a worktree that is already open jumps to its tab.
+A deleted worktree offers to delete its stacks, and a deleted stack offers to delete its worktree.
+The ../worktrees directory is beside the main checkout. Needs git and fzf, and docker for -d.
+Opens a tab in Rex, tmux, WezTerm, and iTerm2. Other terminals get the path.
+EOF
+}
+
+main_worktree() {
+  git worktree list --porcelain | sed -n '1s/^worktree //p'
+}
+
+term_cols() {
+  local size
+  size=$({ stty size </dev/tty; } 2>/dev/null) || size=
+  printf '%s' "${size##* }"
+  if [[ -z $size ]]; then printf '%s' "${COLUMNS:-80}"; fi
+}
+
+is_narrow() {
+  (($(term_cols) < 60))
+}
+
+require_fzf() {
+  command -v fzf >/dev/null 2>&1 || die "fzf is not on PATH"
+  local version major minor
+  version=$(fzf --version)
+  version=${version%% *}
+  major=${version%%.*}
+  minor=${version#*.}
+  minor=${minor%%.*}
+  if ((major == 0 && minor < 53)); then die "wtree needs fzf 0.53 or later, this is fzf $version"; fi
+}
+
+# fzf exits 1 when enter finds no match, such as while the list still loads
+fzf_exit() {
+  case $1 in
+    1) return 0 ;;
+    130) exit 0 ;;
+    *) die "fzf failed with exit code $1" ;;
+  esac
+}
+
+menu() {
+  local title=$1
+  shift
+  printf '%s\n' "$@" | fzf --layout=reverse --height=100% --no-info --no-separator --no-scrollbar \
+    --prompt="$title > " --bind='left-click:accept'
+}
+
+# a wedged Docker Desktop hangs every docker call, and the worktree list must still open
+limited() {
+  "$@" &
+  local job=$! watchdog status=0
+  (
+    sleep 3
+    kill "$job"
+  ) >/dev/null 2>&1 &
+  watchdog=$!
+  { wait "$job"; } 2>/dev/null || status=$?
+  { kill "$watchdog" && wait "$watchdog"; } 2>/dev/null || true
+  return "$status"
+}
+
+worktree_of() {
+  local dir=$1 best='' path
+  [[ -n $dir ]] || return 0
+  while read -r path; do
+    if [[ ($dir == "$path" || $dir == "$path"/*) && ${#path} -gt ${#best} ]]; then best=$path; fi
+  done < <(git worktree list --porcelain | sed -n 's/^worktree //p')
+  printf '%s' "$best"
+}
+
+stacks_in_worktree() {
+  local path=$1 project dir
+  limited docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null |
+    sort -u | while IFS='|' read -r project dir; do
+    if [[ $(worktree_of "$dir") == "$path" ]]; then printf '%s\n' "$project"; fi
+  done | sort -u
+}
+
+list_worktrees() {
+  {
+    limited docker ps -a --filter label=com.docker.compose.project --format 'STACK\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}' 2>/dev/null || true
+    git worktree list --porcelain
+  } | awk -v home="$HOME" -v cols="$(term_cols)" '
+    /^STACK\t/ { split($0, f, "\t"); s++; sp[s] = f[2]; sd[s] = f[3]; ss[s] = f[4]; next }
+    /^worktree / { path = substr($0, 10); ref = ""; gone = "" }
+    /^branch /   { ref = substr($0, 8); sub(/^refs\/heads\//, "", ref) }
+    /^detached/  { ref = "(detached)" }
+    /^prunable/  { gone = " [missing]" }
+    /^$/ { w++; wp[w] = path; wr[w] = ref; wg[w] = gone }
+    END {
+      for (i = 1; i <= s; i++) {
+        best = 0; bestlen = 0
+        for (j = 1; j <= w; j++) {
+          if ((sd[i] == wp[j] || index(sd[i], wp[j] "/") == 1) && length(wp[j]) > bestlen) { best = j; bestlen = length(wp[j]) }
+        }
+        if (!best) continue
+        if (!((best, sp[i]) in total)) { names[best] = names[best] " " sp[i] }
+        total[best, sp[i]]++
+        if (ss[i] == "running") up[best, sp[i]]++
+      }
+      for (j = 1; j <= w; j++) {
+        path = wp[j]
+        name = path; sub(/.*\//, "", name)
+        shown = path
+        if (index(shown, home "/") == 1) shown = "~" substr(shown, length(home) + 1)
+        docker = ""
+        count = split(names[j], list, " ")
+        for (i = 1; i <= count; i++) docker = docker (i > 1 ? ", " : "") sprintf("%s %d/%d up", list[i], up[j, list[i]], total[j, list[i]])
+        if (cols < 60) {
+          if (length(shown) > cols - 6) shown = "…" substr(shown, length(shown) - cols + 8)
+          printf "%s\t\033[1m%s\033[0m\037  \033[36m%s\033[0m\037  \033[2m%s%s\033[0m", path, name, wr[j], shown, wg[j]
+          if (docker != "") printf "\037  \033[33mdocker: %s\033[0m", docker
+          printf "\n"
+        } else {
+          printf "%s\t\033[1m%s\033[0m", path, name
+          if (docker != "") printf "  \033[33mdocker: %s\033[0m", docker
+          printf "\037  \033[36m%s\033[0m  \033[2m%s%s\033[0m\n", wr[j], shown, wg[j]
+        }
+      }
+    }' | tr '\n\037' '\0\n'
+}
+
+rex_cmd() {
+  "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" "$@"
+}
+
+in_target() {
+  local cwd=$1 target=$2 owner
+  [[ $cwd == "$target" || $cwd == "$target"/* ]] || return 1
+  owner=$(worktree_of "$cwd")
+  [[ -z $owner || $owner == "$target" ]]
+}
+
+# the app keeps its own visible tab, so focusing the block on the server does not move the screen
+rex_show_window() {
+  local session=$1 window=$2 clients client shown=''
+  clients=$(rex_cmd api call client.list "{\"kinds\":[\"app\"],\"session_id\":\"$REX_SESSION\"}" | grep -oE '"client_id": *"[^"]*"' | cut -d'"' -f4) || clients=
+  if [[ -z $clients ]]; then
+    clients=$(rex_cmd api call client.list '{"kinds":["app"]}' | grep -oE '"client_id": *"[^"]*"' | cut -d'"' -f4) || clients=
+  fi
+  for client in $clients; do
+    if rex_cmd api call client.perform "{\"client_id\":\"$client\",\"action\":\"session.select\",\"args\":{\"session_id\":\"$session\",\"window_id\":\"$window\"},\"origin\":\"cli\"}" >/dev/null 2>&1; then shown=1; fi
+  done
+  if [[ -z $shown ]]; then
+    printf 'wtree: this worktree is open in another tab, turn on Remote Control in Rex to jump there\n' >&2
+  fi
+}
+
+rex_focus_existing() {
+  local target=$1 session block window cwd sessions
+  sessions=$(rex_cmd api call session.list | grep -oE '"session_id": *"[^"]*"' | cut -d'"' -f4 | grep -Fxv "$REX_SESSION") || sessions=
+  for session in "$REX_SESSION" $sessions; do
+    while read -r block window; do
+      [[ $block != "$REX_BLOCK" ]] || continue
+      cwd=$(rex_cmd api call -s "$session" com.superlogical.terminal.process "{\"block_id\":\"$block\"}" 2>/dev/null |
+        sed -n 's/.*"foreground": *{\([^}]*\)}.*/\1/p' | grep -oE '"cwd": *"[^"]*"' | cut -d'"' -f4) || continue
+      in_target "$cwd" "$target" || continue
+      rex_cmd block focus -s "$session" "$block" >/dev/null
+      rex_show_window "$session" "$window"
+      return 0
+    done < <(rex_cmd block ls -s "$session" --json --short=false | grep -oE '"(block_id|window_id)": *"[^"]*"' |
+      awk -F'"' '$2 == "block_id" { block = $4 } $2 == "window_id" { print block, $4 }')
+  done
+  return 1
+}
+
+tmux_focus_existing() {
+  local target=$1 cwd pane window
+  while IFS=$'\t' read -r cwd pane window; do
+    [[ $pane != "${TMUX_PANE:-}" ]] || continue
+    in_target "$cwd" "$target" || continue
+    tmux switch-client -t "$window" 2>/dev/null || true
+    tmux select-window -t "$window"
+    tmux select-pane -t "$pane"
+    return 0
+  done < <(tmux list-panes -a -F "#{pane_current_path}"$'\t'"#{pane_id}"$'\t'"#{session_name}:#{window_id}")
+  return 1
+}
+
+focus_existing() {
+  local target=$1
+  if [[ -n ${TMUX:-} ]]; then
+    tmux_focus_existing "$target"
+  elif [[ -n ${REX_SESSION:-} ]]; then
+    rex_focus_existing "$target"
+  else
+    return 1
+  fi
+}
+
+open_tab() {
+  local dir=$1 target
+  [[ -d $dir ]] || die "the directory does not exist: $dir"
+  target=$(worktree_of "$dir")
+  target=${target:-$dir}
+  if [[ -n ${TMUX:-} || -n ${REX_SESSION:-} ]] && in_target "$PWD" "$target"; then
+    printf 'wtree: you are already in %s\n' "$target" >&2
+    return 0
+  fi
+  if focus_existing "$target"; then return 0; fi
+  if [[ -n ${TMUX:-} ]]; then
+    tmux new-window -c "$dir" -n "$(basename "$dir")"
+  elif [[ -n ${REX_SESSION:-} ]]; then
+    "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" window new --cwd "$dir" "$(basename "$dir")" >/dev/null
+  elif [[ -n ${WEZTERM_PANE:-} ]]; then
+    wezterm cli spawn --cwd "$dir" >/dev/null
+  elif [[ ${TERM_PROGRAM:-} == iTerm.app ]]; then
+    osascript - "$dir" >/dev/null <<'EOF'
+on run argv
+  tell application "iTerm2" to tell current window
+    set newTab to (create tab with default profile)
+    tell current session of newTab to write text "cd " & quoted form of (item 1 of argv)
+  end tell
+end run
+EOF
+  else
+    printf 'wtree: this terminal has no tab support, open this directory: %s\n' "$dir" >&2
+  fi
+}
+
+new_worktree() {
+  local base path name attempt=0
+  base="$(dirname "$(main_worktree)")/worktrees"
+  while :; do
+    name="${ADJECTIVES[RANDOM % ${#ADJECTIVES[@]}]}-${NOUNS[RANDOM % ${#NOUNS[@]}]}"
+    attempt=$((attempt + 1))
+    if ((attempt > 50)); then name="$name-$RANDOM"; fi
+    path="$base/$name"
+    if [[ ! -e $path ]] && ! git worktree list --porcelain | grep -Fxq "worktree $path"; then break; fi
+  done
+  mkdir -p "$base"
+  git worktree add --quiet --detach "$path" HEAD
+  printf '%s\n' "$path"
+  open_tab "$path"
+}
+
+pause() {
+  printf 'Press a key to continue. '
+  read -r -n1 _ </dev/tty || true
+}
+
+refuse() {
+  printf 'wtree: %s\n' "$*" >&2
+  pause
+  return 0
+}
+
+delete_worktree() {
+  local path=$1 force=${2:-} head answer stacks
+  if [[ $path == "$(main_worktree)" ]]; then
+    refuse "the main checkout cannot be deleted"
+    return 0
+  fi
+  if [[ $path == "$(git rev-parse --show-toplevel 2>/dev/null)" ]]; then
+    refuse "you are in this worktree, run wtree from a different one"
+    return 0
+  fi
+  stacks=$(stacks_in_worktree "$path") || stacks=
+  if [[ ! -d $path ]]; then
+    git worktree prune
+    propose_stacks "$stacks"
+    return 0
+  fi
+  if [[ -n $force ]]; then
+    printf 'FORCE delete %s?\nChanged files, untracked files, ignored files, and commits that no branch or tag holds are lost. [y/N] ' "$path"
+    read -r -n1 answer </dev/tty || answer=n
+    printf '\n'
+    [[ $answer == y || $answer == Y ]] || return 0
+    if ! git worktree remove --force "$path"; then
+      pause
+      return 0
+    fi
+    propose_stacks "$stacks"
+    return 0
+  fi
+  # git worktree remove does not protect commits that only a detached HEAD holds
+  if ! git -C "$path" symbolic-ref -q HEAD >/dev/null; then
+    head=$(git -C "$path" rev-parse HEAD)
+    if [[ -z $(git for-each-ref --contains "$head" --count=1) ]]; then
+      refuse "no branch or tag holds the commit ${head:0:9} of this detached worktree, make a branch first or press ctrl-f"
+      return 0
+    fi
+  fi
+  printf 'Delete %s?\nIgnored files, such as .env and node_modules, are deleted too. [y/N] ' "$path"
+  read -r -n1 answer </dev/tty || answer=n
+  printf '\n'
+  [[ $answer == y || $answer == Y ]] || return 0
+  if ! git worktree remove "$path"; then
+    pause
+    return 0
+  fi
+  propose_stacks "$stacks"
+}
+
+propose_stacks() {
+  local project answer
+  for project in $1; do
+    printf 'Docker stack %s belongs to this worktree.\nDelete it? [y: keep volumes, v: with volumes, N: no] ' "$project"
+    read -r -n1 answer </dev/tty || answer=n
+    printf '\n'
+    case $answer in
+      y | Y) stack_down "$project" ;;
+      v | V) stack_down "$project" volumes ;;
+    esac
+  done
+}
+
+propose_worktree() {
+  local dir=$1 path
+  [[ -n $dir && -d $dir ]] || return 0
+  path=$(worktree_of "$dir")
+  [[ -n $path && $path != "$(main_worktree)" && $path != "$(git rev-parse --show-toplevel 2>/dev/null)" ]] || return 0
+  printf 'The worktree of this stack still exists.\n'
+  delete_worktree "$path"
+}
+
+pick_worktree() {
+  require_fzf
+  local selected path action layout=(--height=80% --header='enter: open   ctrl-d: delete   ctrl-f: force delete   esc: quit')
+  export WTREE_SELF=$0
+  if is_narrow; then
+    layout=(--height=100% --no-scrollbar --bind='left-click:accept' --header=$'enter: menu   esc: quit\nctrl-d: delete   ctrl-f: force')
+  fi
+  while :; do
+    selected=$("$WTREE_SELF" --list | SHELL=$(command -v bash) fzf \
+      --read0 --ansi --highlight-line \
+      --layout=reverse --info=inline \
+      --prompt='worktree > ' \
+      --delimiter=$'\t' --with-nth=2 \
+      "${layout[@]}" \
+      --bind='ctrl-d:execute("$WTREE_SELF" --delete {1})+reload("$WTREE_SELF" --list)' \
+      --bind='ctrl-f:execute("$WTREE_SELF" --force-delete {1})+reload("$WTREE_SELF" --list)') || {
+      fzf_exit $?
+      continue
+    }
+    path=${selected%%$'\t'*}
+    if ! is_narrow; then
+      open_tab "$path"
+      return 0
+    fi
+    action=$(menu "$(basename "$path")" open delete 'force delete' back) || continue
+    case $action in
+      open)
+        open_tab "$path"
+        return 0
+        ;;
+      delete) delete_worktree "$path" ;;
+      'force delete') delete_worktree "$path" force ;;
+    esac
+  done
+}
+
+cache_dir() {
+  printf '%s/wtree' "${XDG_CACHE_HOME:-$HOME/.cache}"
+}
+
+# docker system df needs a minute or more on a large engine, so it runs detached and fills a cache
+refresh_disk() {
+  local dir tmp
+  dir=$(cache_dir)
+  mkdir -p "$dir"
+  find "$dir/lock" -maxdepth 0 -mmin +15 -exec rmdir {} + 2>/dev/null || true
+  mkdir "$dir/lock" 2>/dev/null || return 0
+  tmp="$dir/tmp.$$"
+  (
+    trap 'rm -f "$tmp"; rmdir "$dir/lock"' EXIT
+    docker system df -v --format '{{range .Volumes}}{{.Labels}}\t{{.Size}}\n{{end}}{{range .Containers}}{{.Labels}}\t{{.Size}}\n{{end}}' | awk -F'\t' '
+      function bytes(s, n, u) {
+        n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
+        return n * (u == "kB" ? 1e3 : u == "MB" ? 1e6 : u == "GB" ? 1e9 : u == "TB" ? 1e12 : 1)
+      }
+      match($1, /com\.docker\.compose\.project=[^,]*/) {
+        total[substr($1, RSTART + 27, RLENGTH - 27)] += bytes($2)
+      }
+      END { for (p in total) printf "%s\t%.0f\n", p, total[p] }' >"$tmp"
+    mv "$tmp" "$dir/disk-projects"
+    docker system df --format '{{.Type}}\t{{.Size}}' >"$tmp"
+    mv "$tmp" "$dir/disk-totals"
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+disk_is_old() {
+  local file
+  file="$(cache_dir)/disk-totals"
+  [[ ! -f $file ]] || [[ -n $(find "$file" -mmin +30) ]]
+}
+
+stack_kind() {
+  local project=$1 dir=$2 common=$3 repo=$4 found lower
+  [[ -n $dir ]] || return 0
+  if found=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+    if [[ $found == "$common" ]]; then printf 'live'; fi
+    return 0
+  fi
+  lower=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]')
+  if [[ $lower == "$repo" || $lower == "$repo"-* ]]; then
+    printf 'gone'
+    return 0
+  fi
+  lower=$(printf '%s' "/$dir/" | tr '[:upper:]' '[:lower:]')
+  case $lower in
+    */"$repo"/* | */"$repo"-* | */"$repo".*) printf 'gone' ;;
+  esac
+}
+
+list_stacks() {
+  local common repo project dir kind ncpu memtotal age=-1 lower disk_projects=/dev/null disk_totals=/dev/null cache
+  WTREE_TMP=$(mktemp -d)
+  trap 'rm -rf "$WTREE_TMP"' EXIT
+  common=$(git rev-parse --path-format=absolute --git-common-dir)
+  repo=$(basename "$(main_worktree)" | tr '[:upper:]' '[:lower:]')
+  cache=$(cache_dir)
+
+  docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}\t{{.ID}}' >"$WTREE_TMP/ps"
+  docker stats --no-stream --format '{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}' >"$WTREE_TMP/stats"
+  docker volume ls --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}' >"$WTREE_TMP/volumes"
+  ncpu=$(docker info --format '{{.NCPU}}')
+  memtotal=$(docker info --format '{{.MemTotal}}')
+
+  git worktree list --porcelain | awk '
+    /^worktree / { path = substr($0, 10); ref = "" }
+    /^branch /   { ref = substr($0, 8); sub(/^refs\/heads\//, "", ref) }
+    /^detached/  { ref = "(detached)" }
+    /^$/ { printf "%s\t%s\n", path, ref }' >"$WTREE_TMP/worktrees"
+  : >"$WTREE_TMP/members"
+  while IFS=$'\037' read -r project dir; do
+    kind=$(stack_kind "$project" "$dir" "$common" "$repo")
+    if [[ -n $kind ]]; then printf '%s\t%s\t%s\n' "$project" "$kind" "$dir" >>"$WTREE_TMP/members"; fi
+  done < <(awk -F'\t' '!seen[$1 FS $2]++ { print $1 "\037" $2 }' "$WTREE_TMP/ps")
+  while read -r project; do
+    lower=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]')
+    if [[ $lower == "$repo" || $lower == "$repo"-* ]] && ! cut -f1 "$WTREE_TMP/ps" | grep -Fxq "$project"; then
+      printf '%s\tvolumes\t\n' "$project" >>"$WTREE_TMP/members"
+    fi
+  done < <(sort -u "$WTREE_TMP/volumes")
+
+  if [[ -f $cache/disk-projects ]]; then disk_projects=$cache/disk-projects; fi
+  if [[ -f $cache/disk-totals ]]; then
+    disk_totals=$cache/disk-totals
+    age=$((($(date +%s) - $(date -r "$disk_totals" +%s)) / 60))
+  fi
+
+  awk -F'\t' -v home="$HOME" -v cols="$(term_cols)" -v ncpu="$ncpu" -v memtotal="$memtotal" -v age="$age" -v busy="$([[ -d $cache/lock ]] && echo 1 || echo 0)" \
+    -v worktreesf="$WTREE_TMP/worktrees" -v statsf="$WTREE_TMP/stats" -v membersf="$WTREE_TMP/members" -v psf="$WTREE_TMP/ps" -v volumesf="$WTREE_TMP/volumes" -v diskf="$disk_projects" -v totalsf="$disk_totals" '
+    function bytes(s, n, u) {
+      n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
+      return n * (u == "KiB" ? 1024 : u == "MiB" ? 1048576 : u == "GiB" ? 1073741824 : u == "TiB" ? 1099511627776 : 1)
+    }
+    function whole(s, u) {
+      u = s; sub(/^[0-9.]+/, "", u)
+      return sprintf("%.0f%s", s + 0, u)
+    }
+    function mem_text(b) {
+      if (b >= 1073741824) return sprintf("%.1fGiB", b / 1073741824)
+      return sprintf("%.0fMiB", b / 1048576)
+    }
+    function disk_text(b) {
+      if (b >= 1e9) return sprintf("%.1fGB", b / 1e9)
+      if (b >= 1e6) return sprintf("%.0fMB", b / 1e6)
+      return sprintf("%.0fkB", b / 1e3)
+    }
+    FILENAME == worktreesf { wn++; wp[wn] = $1; wr[wn] = $2; next }
+    FILENAME == statsf { cpu[$1] = $2 + 0; split($3, m, " / "); mem[$1] = bytes(m[1]); allcpu += cpu[$1]; allmem += mem[$1]; next }
+    FILENAME == membersf { if (!($1 in kind) || $2 == "live") { kind[$1] = $2; dir[$1] = $3 } next }
+    FILENAME == psf { if ($1 in kind) { n[$1, $3]++; pcpu[$1] += cpu[$4]; pmem[$1] += mem[$4] } next }
+    FILENAME == volumesf { vols[$1]++; next }
+    FILENAME == diskf { disk[$1] = $2; next }
+    FILENAME == totalsf { total[$1] = $2; next }
+    END {
+      narrow = cols < 60
+      line = sprintf(narrow ? "CPU %.0f%%/%d%%  mem %s/%s" : "Docker  CPU %.0f%% of %d%%   memory %s of %s", allcpu, ncpu * 100, mem_text(allmem), mem_text(memtotal))
+      if (age < 0) d = narrow ? "disk: reading, ctrl-r later" : "disk: Docker is reading the sizes, press ctrl-r later"
+      else if (narrow) d = sprintf("img %s ctr %s vol %s bld %s %dm%s", whole(total["Images"]), whole(total["Containers"]), whole(total["Local Volumes"]), whole(total["Build Cache"]), age, busy ? " upd" : "")
+      else d = sprintf("disk: images %s, containers %s, volumes %s, build %s (%d min old%s)", total["Images"], total["Containers"], total["Local Volumes"], total["Build Cache"], age, busy ? ", update in progress" : "")
+      printf "0\t1\t\t\t\033[2m%s\033[0m\n", line
+      printf "0\t2\t\t\t\033[2m%s\033[0m\n", d
+      states = "running paused restarting created exited dead removing"
+      count = split(states, st, " ")
+      for (p in kind) {
+        state = ""
+        for (i = 1; i <= count; i++) if ((p, st[i]) in n) state = state (state == "" ? "" : ", ") st[i] " " n[p, st[i]]
+        if (state == "") state = "no containers"
+        note = kind[p] == "gone" ? "  \033[33mworktree gone\033[0m" : kind[p] == "volumes" ? "  \033[33mvolumes only\033[0m" : ""
+        branch = ""; bestlen = 0
+        for (j = 1; j <= wn; j++) {
+          if ((dir[p] == wp[j] || index(dir[p], wp[j] "/") == 1) && length(wp[j]) > bestlen) { branch = wr[j]; bestlen = length(wp[j]) }
+        }
+        on = branch == "" ? "" : "\033[35mon " branch "\033[0m"
+        shown = dir[p]
+        if (index(shown, home "/") == 1) shown = "~" substr(shown, length(home) + 1)
+        usage = (((p, "running") in n) ? sprintf("CPU %.1f%%  memory %s  ", pcpu[p], mem_text(pmem[p])) : "") "disk " ((p in disk) ? disk_text(disk[p]) : "?") "  volumes " (vols[p] + 0)
+        rank = ((p, "running") in n) ? 1 : 2
+        if (narrow) {
+          usage = ((rank == 1) ? sprintf("CPU %.1f%%  mem %s  ", pcpu[p], mem_text(pmem[p])) : "") "disk " ((p in disk) ? disk_text(disk[p]) : "?") "  vol " (vols[p] + 0)
+          if (on != "") usage = on "\037  " usage
+          if (length(shown) > cols - 6) shown = "…" substr(shown, length(shown) - cols + 8)
+          printf "%d\t%s\t%s\t%s\t\033[1m%s\033[0m\037  \033[36m%s\033[0m%s\037  %s\037  \033[2m%s\033[0m\n", rank, p, p, dir[p], p, state, note, usage, shown
+        } else {
+          if (on != "") note = note "  " on
+          printf "%d\t%s\t%s\t%s\t\033[1m%s\033[0m  \033[36m%s\033[0m%s\037  %s  \033[2m%s\033[0m\n", rank, p, p, dir[p], p, state, note, usage, shown
+        }
+      }
+    }' "$WTREE_TMP/worktrees" "$WTREE_TMP/stats" "$WTREE_TMP/members" "$WTREE_TMP/ps" "$WTREE_TMP/volumes" "$disk_projects" "$disk_totals" |
+    sort | cut -f3- | tr '\n\037' '\0\n'
+}
+
+stop_stack() {
+  if ! docker compose -p "$1" stop; then pause; fi
+}
+
+delete_stack() {
+  local project=$1 dir=$2 with_volumes=${3:-} main count answer
+  if [[ -z $project ]]; then return 0; fi
+  if [[ -z $with_volumes ]]; then
+    printf 'Delete the containers and networks of %s? The volumes stay. [y/N] ' "$project"
+    read -r -n1 answer </dev/tty || answer=n
+    printf '\n'
+    [[ $answer == y || $answer == Y ]] || return 0
+  else
+    main=$(main_worktree)
+    count=$(docker volume ls -q --filter "label=com.docker.compose.project=$project" | wc -l | tr -d ' ')
+    if [[ $dir == "$main" || $dir == "$main"/* ]]; then
+      printf 'This stack belongs to the main checkout.\nThe %s volumes of %s and their data are lost.\nType the stack name to delete: ' "$count" "$project"
+      read -r answer </dev/tty || answer=
+      [[ $answer == "$project" ]] || return 0
+    else
+      printf 'Delete %s and its %s volumes? The data in the volumes is lost. [y/N] ' "$project" "$count"
+      read -r -n1 answer </dev/tty || answer=n
+      printf '\n'
+      [[ $answer == y || $answer == Y ]] || return 0
+    fi
+  fi
+  stack_down "$project" "$with_volumes" || return 0
+  propose_worktree "$dir"
+}
+
+stack_down() {
+  local project=$1 with_volumes=${2:-} volume
+  if ! docker compose -p "$project" down; then
+    pause
+    return 1
+  fi
+  if [[ -n $with_volumes ]]; then
+    for volume in $(docker volume ls -q --filter "label=com.docker.compose.project=$project"); do
+      if ! docker volume rm "$volume"; then pause; fi
+    done
+  fi
+  refresh_disk
+}
+
+pick_stack() {
+  require_fzf
+  command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
+  docker info >/dev/null 2>&1 || die "Docker is not running"
+  local selected project dir action layout=(--height=80% --header=$'enter: open   ctrl-s: stop   ctrl-d: delete   ctrl-f: delete with volumes\nctrl-r: reload   esc: quit')
+  export WTREE_SELF=$0
+  if disk_is_old; then refresh_disk; fi
+  if is_narrow; then
+    layout=(--height=100% --no-scrollbar --bind='left-click:accept' --header=$'enter: menu   ctrl-r: reload   esc: quit')
+  fi
+  while :; do
+    selected=$("$WTREE_SELF" --stack-list | SHELL=$(command -v bash) fzf \
+      --read0 --ansi --highlight-line --header-lines=2 \
+      --layout=reverse --info=inline \
+      --prompt='stack > ' \
+      --delimiter=$'\t' --with-nth=3 \
+      "${layout[@]}" \
+      --bind='ctrl-s:execute("$WTREE_SELF" --stack-stop {1})+reload("$WTREE_SELF" --stack-list)' \
+      --bind='ctrl-d:execute("$WTREE_SELF" --stack-delete {1} {2})+reload("$WTREE_SELF" --stack-list)' \
+      --bind='ctrl-f:execute("$WTREE_SELF" --stack-purge {1} {2})+reload("$WTREE_SELF" --stack-list)' \
+      --bind='ctrl-r:reload("$WTREE_SELF" --stack-list)') || {
+      fzf_exit $?
+      continue
+    }
+    project=${selected%%$'\t'*}
+    dir=${selected#*$'\t'}
+    dir=${dir%%$'\t'*}
+    if is_narrow; then
+      action=$(menu "$project" open stop 'delete, keep volumes' 'delete with volumes' back) || continue
+    else
+      action=open
+    fi
+    case $action in
+      open)
+        [[ -n $dir ]] || die "this stack has no directory"
+        open_tab "$dir"
+        return 0
+        ;;
+      stop) stop_stack "$project" ;;
+      'delete, keep volumes') delete_stack "$project" "$dir" ;;
+      'delete with volumes') delete_stack "$project" "$dir" volumes ;;
+    esac
+  done
+}
+
+# bash reads a script while it runs, so load all of it before the first command
+main() {
+  local mode
+  mode=${1:-}
+  case $mode in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    "" | -n | --new | --list | -d | --docker | --stack-list) (($# <= 1)) || die "unknown argument: $2" ;;
+    --stack-stop) (($# == 2)) || die "$mode needs one stack" ;;
+    --stack-delete | --stack-purge) (($# == 3)) || die "$mode needs a stack and a directory" ;;
+    --delete | --force-delete) (($# == 2)) || die "$mode needs one path" ;;
+    *)
+      usage >&2
+      die "unknown argument: $mode"
+      ;;
+  esac
+
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $PWD"
+
+  case $mode in
+    "") pick_worktree ;;
+    -n | --new) new_worktree ;;
+    --list) list_worktrees ;;
+    --delete) delete_worktree "$2" ;;
+    --force-delete) delete_worktree "$2" force ;;
+    -d | --docker) pick_stack ;;
+    --stack-list) list_stacks ;;
+    --stack-stop) stop_stack "$2" ;;
+    --stack-delete) delete_stack "$2" "$3" ;;
+    --stack-purge) delete_stack "$2" "$3" volumes ;;
+  esac
+}
+
+main "$@"; exit
