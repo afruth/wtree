@@ -12,23 +12,52 @@ die() {
 usage() {
   cat <<'EOF'
 usage: wtree       search the worktrees of this repo
-                enter: open, ctrl-d: delete, ctrl-f: force delete
+                enter: open, ctrl-d: delete, ctrl-f: force delete, ctrl-r: reload
        wtree -n    create a worktree at the current HEAD in ../worktrees and open it
        wtree -d    search the Docker Compose stacks of this repo and its worktrees, with usage
                 enter: open, ctrl-s: stop, ctrl-d: delete and keep volumes,
                 ctrl-f: delete with volumes, ctrl-r: reload
+       wtree -g    search all the worktrees on this machine, in any directory
+       wtree -g -d search all the Docker Compose stacks on this machine, in any directory
 
+In a list, tab selects an entry and ctrl-a selects all the matches. A key then acts on all the
+selected entries, after one confirmation, and shows the progress.
 On screens narrower than 60 columns, enter or a tap opens a menu of these actions.
 Opening a worktree that is already open jumps to its tab.
 A deleted worktree offers to delete its stacks, and a deleted stack offers to delete its worktree.
 The ../worktrees directory is beside the main checkout. Needs git and fzf, and docker for -d.
+wtree -g looks for repos in $HOME, or in the directories of WTREE_ROOTS, separated by a colon.
 Opens or jumps to a tab in Rex, herdr, cmux, tmux, zellij, WezTerm, kitty, Ghostty, iTerm2, and Terminal.
 Other terminals get the path.
 EOF
 }
 
 main_worktree() {
-  git worktree list --porcelain | sed -n '1s/^worktree //p'
+  main_of .
+}
+
+# git -C accepts a checkout or a .git directory, and a worktree that is gone still has its repo
+main_of() {
+  { git -C "$1" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p'; } || true
+}
+
+common_of() {
+  git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+}
+
+is_global() {
+  [[ -n ${WTREE_GLOBAL:-} ]]
+}
+
+plural() {
+  if (($1 == 1)); then printf '1 %s' "$2"; else printf '%d %ss' "$1" "$2"; fi
+}
+
+short_path() {
+  case $1 in
+    "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
+    *) printf '%s' "$1" ;;
+  esac
 }
 
 term_cols() {
@@ -84,33 +113,118 @@ limited() {
 }
 
 worktree_of() {
-  local dir=$1 best='' path
+  local dir=$1 anchor=$2 best='' path
   [[ -n $dir ]] || return 0
   while read -r path; do
     if [[ ($dir == "$path" || $dir == "$path"/*) && ${#path} -gt ${#best} ]]; then best=$path; fi
-  done < <(git worktree list --porcelain | sed -n 's/^worktree //p')
+  done < <(git -C "$anchor" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
   printf '%s' "$best"
 }
 
+stack_pairs() {
+  { limited docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u; } || true
+}
+
 stacks_in_worktree() {
-  local path=$1 project dir
-  limited docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null |
-    sort -u | while IFS='|' read -r project dir; do
-    if [[ $(worktree_of "$dir") == "$path" ]]; then printf '%s\n' "$project"; fi
+  local path=$1 common=$2 pairs=$3 project dir
+  printf '%s\n' "$pairs" | while IFS='|' read -r project dir; do
+    if [[ $dir == "$path" || $dir == "$path"/* ]] && [[ $(worktree_of "$dir" "$common") == "$path" ]]; then
+      printf '%s\n' "$project"
+    fi
   done | sort -u
 }
 
-list_worktrees() {
+# git keeps no list of the repos on a machine, so look for .git entries
+scan_repos() {
+  local root dotgit roots
+  roots=${WTREE_ROOTS:-$HOME}
+  printf '%s\n' "$roots" | tr ':' '\n' | while read -r root; do
+    [[ -n $root ]] || continue
+    find "$root" -xdev \( -type d \( -name node_modules -o -name .cache -o -name .local -o -name .config -o -name .tmp -o -path "*/.claude/plugins" -o -name .npm -o -name .cargo -o -name .rustup -o -name .nvm \
+      -o -name .venv -o -name venv -o -name __pycache__ -o -name .pnpm-store -o -name .Trash -o -path "$root/Library" \) -prune \) \
+      -o -name .git -print -prune 2>/dev/null || true
+  done | while read -r dotgit; do
+    if [[ ! -d $dotgit ]]; then
+      repo_of_dir "${dotgit%/.git}"
+    elif [[ -f $dotgit/HEAD ]]; then
+      (cd "$dotgit" && pwd -P)
+    fi
+  done | sort -u
+}
+
+# a submodule has its own .git entry, but it is not a worktree
+repo_of_dir() {
+  if [[ -z $(git -C "$1" rev-parse --show-superproject-working-tree 2>/dev/null) ]]; then common_of "$1" || true; fi
+}
+
+rescan_repos() {
+  local dir tmp
+  dir=$(cache_dir)
+  mkdir -p "$dir"
+  tmp="$dir/repos.$$"
+  scan_repos >"$tmp"
+  mv "$tmp" "$dir/repos"
+}
+
+# the scan can take long on a large disk, so a list reads the last result and a new scan runs behind it
+known_repos() {
+  local file
+  file="$(cache_dir)/repos"
+  if [[ ! -f $file ]]; then
+    rescan_repos
+  elif [[ -n $(find "$file" -mmin +30) ]]; then
+    (rescan_repos) </dev/null >/dev/null 2>&1 &
+  fi
+  cat "$file"
+}
+
+# a stack can be outside the directories that the scan reads
+list_repos() {
+  local stack_dirs=$1 dir common
+  if ! is_global; then
+    common_of "$PWD"
+    return 0
+  fi
   {
-    limited docker ps -a --filter label=com.docker.compose.project --format 'STACK\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}' 2>/dev/null || true
-    git worktree list --porcelain
-  } | awk -v home="$HOME" -v cols="$(term_cols)" '
+    known_repos
+    printf '%s\n' "$stack_dirs" | sort -u | while read -r dir; do
+      if [[ -n $dir && -d $dir ]]; then repo_of_dir "$dir"; fi
+    done
+    repo_of_dir "$PWD"
+  } | sort -u | while read -r common; do
+    if [[ -d $common ]]; then printf '%s\n' "$common"; fi
+  done
+}
+
+worktree_stream() {
+  local common
+  while read -r common; do
+    printf 'repo %s\n' "$common"
+    git -C "$common" worktree list --porcelain 2>/dev/null || true
+  done
+}
+
+list_worktrees() {
+  local stacks
+  stacks=$(limited docker ps -a --filter label=com.docker.compose.project --format 'STACK\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}' 2>/dev/null) || stacks=
+  {
+    if [[ -n $stacks ]]; then printf '%s\n' "$stacks"; fi
+    list_repos "$(printf '%s\n' "$stacks" | cut -s -f3)" | worktree_stream
+  } | awk -v home="$HOME" -v cols="$(term_cols)" -v global="${WTREE_GLOBAL:-}" '
+    function basename_of(p) { sub(/\/$/, "", p); sub(/.*\//, "", p); return p }
     /^STACK\t/ { split($0, f, "\t"); s++; sp[s] = f[2]; sd[s] = f[3]; ss[s] = f[4]; next }
-    /^worktree / { path = substr($0, 10); ref = ""; gone = "" }
+    /^repo /     { repo = substr($0, 6); first = 1; next }
+    /^worktree / { path = substr($0, 10); ref = ""; gone = ""; bare = 0 }
     /^branch /   { ref = substr($0, 8); sub(/^refs\/heads\//, "", ref) }
     /^detached/  { ref = "(detached)" }
     /^prunable/  { gone = " [missing]" }
-    /^$/ { w++; wp[w] = path; wr[w] = ref; wg[w] = gone }
+    /^bare/      { bare = 1 }
+    /^$/ {
+      if (first) { reponame = basename_of(path); sub(/\.git$/, "", reponame) }
+      main = first; first = 0
+      if (bare && global != "") next
+      w++; wp[w] = path; wr[w] = ref; wg[w] = gone; wc[w] = repo; wn[w] = reponame; wm[w] = main
+    }
     END {
       for (i = 1; i <= s; i++) {
         best = 0; bestlen = 0
@@ -130,13 +244,14 @@ list_worktrees() {
         docker = ""
         count = split(names[j], list, " ")
         for (i = 1; i <= count; i++) docker = docker (i > 1 ? ", " : "") sprintf("%s %d/%d up", list[i], up[j, list[i]], total[j, list[i]])
+        owner = (global != "" && !wm[j]) ? "  \033[34m" wn[j] "\033[0m" : ""
         if (cols < 60) {
           if (length(shown) > cols - 6) shown = "…" substr(shown, length(shown) - cols + 8)
-          printf "%s\t\033[1m%s\033[0m\037  \033[36m%s\033[0m\037  \033[2m%s%s\033[0m", path, name, wr[j], shown, wg[j]
+          printf "%s\t%s\t\033[1m%s\033[0m%s\037  \033[36m%s\033[0m\037  \033[2m%s%s\033[0m", path, wc[j], name, owner, wr[j], shown, wg[j]
           if (docker != "") printf "\037  \033[33mdocker: %s\033[0m", docker
           printf "\n"
         } else {
-          printf "%s\t\033[1m%s\033[0m", path, name
+          printf "%s\t%s\t\033[1m%s\033[0m%s", path, wc[j], name, owner
           if (docker != "") printf "  \033[33mdocker: %s\033[0m", docker
           printf "\037  \033[36m%s\033[0m  \033[2m%s%s\033[0m\n", wr[j], shown, wg[j]
         }
@@ -173,7 +288,7 @@ terminal_kind() {
 in_target() {
   local cwd=$1 target=$2 owner
   [[ $cwd == "$target" || $cwd == "$target"/* ]] || return 1
-  owner=$(worktree_of "$cwd")
+  owner=$(worktree_of "$cwd" "$target")
   [[ -z $owner || $owner == "$target" ]]
 }
 
@@ -482,7 +597,7 @@ open_tab() {
     printf 'wtree: this terminal has no tab support, open this directory: %s\n' "$dir" >&2
     return 0
   fi
-  target=$(worktree_of "$dir")
+  target=$(worktree_of "$dir" "$dir")
   target=${target:-$dir}
   if in_target "$PWD" "$target"; then
     printf 'wtree: you are already in %s\n' "$target" >&2
@@ -521,107 +636,305 @@ refuse() {
   return 0
 }
 
-delete_worktree() {
-  local path=$1 force=${2:-} head answer stacks
-  if [[ $path == "$(main_worktree)" ]]; then
-    refuse "the main checkout cannot be deleted"
-    return 0
-  fi
-  if [[ $path == "$(git rev-parse --show-toplevel 2>/dev/null)" ]]; then
-    refuse "you are in this worktree, run wtree from a different one"
-    return 0
-  fi
-  stacks=$(stacks_in_worktree "$path") || stacks=
-  if [[ ! -d $path ]]; then
-    git worktree prune
-    propose_stacks "$stacks"
-    return 0
-  fi
-  if [[ -n $force ]]; then
-    printf 'FORCE delete %s?\nChanged files, untracked files, ignored files, and commits that no branch or tag holds are lost. [y/N] ' "$path"
-    read -r -n1 answer </dev/tty || answer=n
-    printf '\n'
-    [[ $answer == y || $answer == Y ]] || return 0
-    if ! git worktree remove --force "$path"; then
-      pause
-      return 0
+read_key() {
+  KEY=
+  read -r -n1 KEY </dev/tty || KEY=
+  printf '\n'
+}
+
+confirm() {
+  printf '%s [y/N] ' "$1"
+  read_key
+  [[ $KEY == y || $KEY == Y ]]
+}
+
+STEP_COUNT=0
+SHOW_OUTPUT=
+declare -a STEP_LABEL STEP_AFTER STEP_CMD STEP_RESULT
+
+# after: the steps that must succeed first, separated by a space
+add_step() {
+  local after=$1 label=$2
+  shift 2
+  STEP_LABEL[STEP_COUNT]=$label
+  STEP_AFTER[STEP_COUNT]=$after
+  STEP_CMD[STEP_COUNT]=$(printf '%q ' "$@")
+  STEP_COUNT=$((STEP_COUNT + 1))
+}
+
+draw_progress() {
+  local finished=$1 total=$2 text=$3 cols=$4 width=20 filled i bar='' room
+  [[ -t 1 ]] || return 0
+  if ((cols < 60)); then width=10; fi
+  filled=$((finished * width / total))
+  for ((i = 0; i < width; i++)); do
+    if ((i < filled)); then bar+='█'; else bar+='░'; fi
+  done
+  room=$((cols - width - 4))
+  if ((room < 8)); then room=8; fi
+  if ((${#text} > room)); then text="${text:0:room-1}…"; fi
+  printf '\r\033[K[%s] %s' "$bar" "$text"
+}
+
+# the output of a step goes to a file, so that it does not break the progress line
+run_steps() {
+  local i dep blocked pid status log cols frame=0 frames='|/-\' failed=0 skipped=0 finished=0
+  local total=$STEP_COUNT
+  log=$(mktemp)
+  cols=$(term_cols)
+  for ((i = 0; i < total; i++)); do
+    blocked=
+    for dep in ${STEP_AFTER[i]}; do
+      if [[ ${STEP_RESULT[dep]} != ok ]]; then blocked=1; fi
+    done
+    if [[ -n $blocked ]]; then
+      STEP_RESULT[i]=skipped
+      skipped=$((skipped + 1))
+      finished=$((finished + 1))
+      printf '\r\033[K- %s: skipped, an earlier step failed\n' "${STEP_LABEL[i]}"
+      continue
     fi
-    propose_stacks "$stacks"
+    (eval "${STEP_CMD[i]}") </dev/null >"$log" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      draw_progress "$finished" "$total" "$((i + 1))/$total ${frames:frame%4:1} ${STEP_LABEL[i]}" "$cols"
+      frame=$((frame + 1))
+      sleep 0.1
+    done
+    status=0
+    wait "$pid" || status=$?
+    finished=$((finished + 1))
+    if ((status == 0)); then
+      STEP_RESULT[i]=ok
+      printf '\r\033[K✓ %s\n' "${STEP_LABEL[i]}"
+      if [[ -n $SHOW_OUTPUT ]]; then sed 's/^/    /' "$log"; fi
+    else
+      STEP_RESULT[i]=failed
+      failed=$((failed + 1))
+      printf '\r\033[K✗ %s\n' "${STEP_LABEL[i]}"
+      tail -n 8 "$log" | sed 's/^/    /'
+    fi
+  done
+  rm -f "$log"
+  draw_progress "$finished" "$total" "$((finished - failed - skipped)) of $total done" "$cols"
+  if [[ -t 1 ]]; then printf '\n'; else printf '%d of %d done\n' "$((finished - failed - skipped))" "$total"; fi
+  if ((failed > 0)); then
+    printf '%s, %d skipped.\n' "$(plural "$failed" 'step') failed" "$skipped"
+    pause
+    return 1
+  fi
+}
+
+remove_worktree() {
+  local path=$1 common=$2 force=${3:-}
+  if [[ -n $force ]]; then
+    git -C "$common" worktree remove --force "$path"
+  else
+    git -C "$common" worktree remove "$path"
+  fi
+}
+
+# prints why a plain delete must not take this worktree
+worktree_risk() {
+  local path=$1 common=$2 head
+  if [[ -n $(git -C "$path" status --porcelain 2>/dev/null) ]]; then
+    printf 'it has changed files'
     return 0
   fi
   # git worktree remove does not protect commits that only a detached HEAD holds
-  if ! git -C "$path" symbolic-ref -q HEAD >/dev/null; then
-    head=$(git -C "$path" rev-parse HEAD)
-    if [[ -z $(git for-each-ref --contains "$head" --count=1) ]]; then
-      refuse "no branch or tag holds the commit ${head:0:9} of this detached worktree, make a branch first or press ctrl-f"
+  if ! git -C "$path" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    head=$(git -C "$path" rev-parse HEAD 2>/dev/null) || {
+      printf 'git cannot read it'
       return 0
+    }
+    if [[ -z $(git -C "$common" for-each-ref --contains "$head" --count=1) ]]; then
+      printf 'no branch or tag holds its commit %s' "${head:0:9}"
     fi
   fi
-  printf 'Delete %s?\nIgnored files, such as .env and node_modules, are deleted too. [y/N] ' "$path"
-  read -r -n1 answer </dev/tty || answer=n
-  printf '\n'
-  [[ $answer == y || $answer == Y ]] || return 0
-  if ! git worktree remove "$path"; then
-    pause
+}
+
+# args: force, then the paths, then the repo of each path
+delete_worktrees() {
+  local force=$1
+  shift
+  local count=$(($# / 2)) i k n=0 skipped=0 path common main current risk pairs project stacks seen=' ' stack_mode=''
+  ((count > 0)) || return 0
+  local paths=("${@:1:count}") commons=("${@:count+1}")
+  local go_path=() go_common=() go_note=() skip_text=() stack_name=() stack_owner=() wt_step=()
+  current=$(git rev-parse --show-toplevel 2>/dev/null) || current=
+  for ((i = 0; i < count; i++)); do
+    path=${paths[i]}
+    common=${commons[i]}
+    main=$(main_of "$common")
+    risk=
+    if [[ $path == "$main" ]]; then
+      skip_text[${#skip_text[@]}]="$(basename "$path"): it is the main checkout"
+      continue
+    elif [[ $path == "$current" ]]; then
+      skip_text[${#skip_text[@]}]="$(basename "$path"): you are in this worktree, run wtree from a different one"
+      continue
+    elif [[ -d $path ]]; then
+      risk=$(worktree_risk "$path" "$common")
+      if [[ -n $risk && -z $force ]]; then
+        skip_text[${#skip_text[@]}]="$(basename "$path"): $risk, press ctrl-f to delete it"
+        continue
+      fi
+    else
+      risk='its directory is missing'
+    fi
+    k=${#go_path[@]}
+    go_path[k]=$path
+    go_common[k]=$common
+    go_note[k]=$risk
+  done
+  n=${#go_path[@]}
+  if ((n > 0)); then pairs=$(stack_pairs); fi
+  for ((k = 0; k < n; k++)); do
+    stacks=$(stacks_in_worktree "${go_path[k]}" "${go_common[k]}" "$pairs")
+    for project in $stacks; do
+      if [[ $seen == *" $project "* ]]; then continue; fi
+      seen="$seen$project "
+      i=${#stack_name[@]}
+      stack_name[i]=$project
+      stack_owner[i]=$k
+    done
+  done
+
+  if ((${#skip_text[@]} > 0)); then
+    printf 'These stay:\n'
+    for ((i = 0; i < ${#skip_text[@]}; i++)); do printf '  %s\n' "${skip_text[i]}"; done
+  fi
+  if ((n == 0)); then
+    refuse "nothing to delete"
     return 0
   fi
-  propose_stacks "$stacks"
-}
-
-propose_stacks() {
-  local project answer
-  for project in $1; do
-    printf 'Docker stack %s belongs to this worktree.\nDelete it? [y: keep volumes, v: with volumes, N: no] ' "$project"
-    read -r -n1 answer </dev/tty || answer=n
+  if [[ -n $force ]]; then printf 'FORCE delete %s:\n' "$(plural "$n" 'worktree')"; else printf 'Delete %s:\n' "$(plural "$n" 'worktree')"; fi
+  for ((k = 0; k < n; k++)); do
+    printf '  %s' "$(short_path "${go_path[k]}")"
+    if [[ -n ${go_note[k]} ]]; then printf '  (%s)' "${go_note[k]}"; fi
     printf '\n'
-    case $answer in
-      y | Y) stack_down "$project" ;;
-      v | V) stack_down "$project" volumes ;;
-    esac
   done
+  if [[ -n $force ]]; then
+    printf 'Changed files, untracked files, ignored files, and commits that no branch or tag holds are lost.\n'
+  else
+    printf 'Ignored files, such as .env and node_modules, are deleted too.\n'
+  fi
+  if ((${#stack_name[@]} == 0)); then
+    confirm 'Continue?' || return 0
+  else
+    printf 'Docker stacks of these worktrees:\n'
+    for ((i = 0; i < ${#stack_name[@]}; i++)); do
+      printf '  %s  (%s)\n' "${stack_name[i]}" "$(basename "${go_path[stack_owner[i]]}")"
+    done
+    printf '[y: worktrees only, s: and stacks, keep volumes, v: and stacks with volumes, N: no] '
+    read_key
+    case $KEY in
+      y | Y) ;;
+      s | S) stack_mode=keep ;;
+      v | V) stack_mode=volumes ;;
+      *) return 0 ;;
+    esac
+  fi
+
+  for ((k = 0; k < n; k++)); do
+    if [[ -d ${go_path[k]} ]]; then
+      add_step '' "delete worktree $(basename "${go_path[k]}")" remove_worktree "${go_path[k]}" "${go_common[k]}" "$force"
+    else
+      add_step '' "remove missing worktree $(basename "${go_path[k]}")" git -C "${go_common[k]}" worktree prune
+    fi
+    wt_step[k]=$((STEP_COUNT - 1))
+  done
+  if [[ -n $stack_mode ]]; then
+    for ((i = 0; i < ${#stack_name[@]}; i++)); do
+      add_step "${wt_step[stack_owner[i]]}" "delete stack ${stack_name[i]}" stack_down "${stack_name[i]}" "${stack_mode/keep/}"
+    done
+  fi
+  run_steps || true
+  if [[ -n $stack_mode ]]; then refresh_disk; fi
 }
 
-propose_worktree() {
-  local dir=$1 path
-  [[ -n $dir && -d $dir ]] || return 0
-  path=$(worktree_of "$dir")
-  [[ -n $path && $path != "$(main_worktree)" && $path != "$(git rev-parse --show-toplevel 2>/dev/null)" ]] || return 0
-  printf 'The worktree of this stack still exists.\n'
-  delete_worktree "$path"
+open_many() {
+  local dir dirs=() status=0
+  for dir in "$@"; do
+    if [[ -n $dir ]]; then dirs[${#dirs[@]}]=$dir; fi
+  done
+  ((${#dirs[@]} > 0)) || die "the selection has no directory"
+  if ((${#dirs[@]} == 1)); then
+    open_tab "${dirs[0]}"
+    return 0
+  fi
+  printf 'Open %s:\n' "$(plural "${#dirs[@]}" 'tab')"
+  for dir in "${dirs[@]}"; do printf '  %s\n' "$(short_path "$dir")"; done
+  confirm 'Continue?' || return 0
+  for dir in "${dirs[@]}"; do add_step '' "open $(basename "$dir")" open_tab "$dir"; done
+  SHOW_OUTPUT=1
+  run_steps || status=1
+  return "$status"
+}
+
+# PICKED_1 and PICKED_2 get the first two fields of each selected row
+split_selection() {
+  local rest=$1 row n=0
+  PICKED_1=()
+  PICKED_2=()
+  while [[ $rest == *$'\036'* ]]; do
+    row=${rest%%$'\036'*}
+    rest=${rest#*$'\036'}
+    PICKED_1[n]=${row%%$'\t'*}
+    row=${row#*$'\t'}
+    PICKED_2[n]=${row%%$'\t'*}
+    n=$((n + 1))
+  done
 }
 
 pick_worktree() {
   require_fzf
-  local selected path action layout=(--height=80% --header='enter: open   ctrl-d: delete   ctrl-f: force delete   esc: quit')
+  local selected count title action tap='' layout
   export WTREE_SELF=$0
-  if is_narrow; then
-    layout=(--height=100% --no-scrollbar --bind='left-click:accept' --header=$'enter: menu   esc: quit\nctrl-d: delete   ctrl-f: force')
-  fi
   while :; do
-    selected=$("$WTREE_SELF" --list | SHELL=$(command -v bash) fzf \
-      --read0 --ansi --highlight-line \
+    layout=(--height=80% --header=$'tab: select   ctrl-a: select all   enter: open   ctrl-d: delete   ctrl-f: force delete\nctrl-r: reload   esc: quit')
+    if [[ -n $tap ]]; then
+      layout=(--height=100% --no-scrollbar --bind='left-click:toggle' --header=$'tap: select   enter: actions   esc: quit')
+    elif is_narrow; then
+      layout=(--height=100% --no-scrollbar --bind='left-click:accept' --header=$'enter: menu   tab: select   esc: quit\nctrl-d: delete   ctrl-f: force')
+    fi
+    selected=$(: | SHELL=$(command -v bash) fzf \
+      --read0 --print0 --multi --ansi --highlight-line \
       --layout=reverse --info=inline \
-      --prompt='worktree > ' \
-      --delimiter=$'\t' --with-nth=2 \
+      --prompt="$(is_global && printf 'all worktrees' || printf 'worktree') > " \
+      --delimiter=$'\t' --with-nth=3 \
       "${layout[@]}" \
-      --bind='ctrl-d:execute("$WTREE_SELF" --delete {1})+reload("$WTREE_SELF" --list)' \
-      --bind='ctrl-f:execute("$WTREE_SELF" --force-delete {1})+reload("$WTREE_SELF" --list)') || {
+      --bind='start:reload("$WTREE_SELF" --list)' \
+      --bind='ctrl-a:toggle-all' \
+      --bind='ctrl-d:execute("$WTREE_SELF" --delete {+1} {+2})+reload("$WTREE_SELF" --list)' \
+      --bind='ctrl-f:execute("$WTREE_SELF" --force-delete {+1} {+2})+reload("$WTREE_SELF" --list)' \
+      --bind='ctrl-r:reload("$WTREE_SELF" --rescan)' | tr '\0' '\036') || {
       fzf_exit $?
       continue
     }
-    path=${selected%%$'\t'*}
-    if ! is_narrow; then
-      open_tab "$path"
+    split_selection "$selected"
+    count=${#PICKED_1[@]}
+    ((count > 0)) || continue
+    if [[ -z $tap ]] && ! is_narrow; then
+      open_many "${PICKED_1[@]}"
       return 0
     fi
-    action=$(menu "$(basename "$path")" open delete 'force delete' back) || continue
+    tap=
+    if ((count == 1)); then
+      title=$(basename "${PICKED_1[0]}")
+      action=$(menu "$title" open delete 'force delete' 'select several' back) || continue
+    else
+      title=$(plural "$count" 'worktree')
+      action=$(menu "$title" open delete 'force delete' back) || continue
+    fi
     case $action in
       open)
-        open_tab "$path"
+        open_many "${PICKED_1[@]}"
         return 0
         ;;
-      delete) delete_worktree "$path" ;;
-      'force delete') delete_worktree "$path" force ;;
+      delete) delete_worktrees '' "${PICKED_1[@]}" "${PICKED_2[@]}" ;;
+      'force delete') delete_worktrees force "${PICKED_1[@]}" "${PICKED_2[@]}" ;;
+      'select several') tap=1 ;;
     esac
   done
 }
@@ -663,8 +976,18 @@ disk_is_old() {
 
 stack_kind() {
   local project=$1 dir=$2 common=$3 repo=$4 found lower
+  if is_global; then
+    if [[ -z $dir ]] || found=$(common_of "$dir"); then
+      printf 'live'
+    elif [[ -d $dir ]]; then
+      printf 'plain'
+    else
+      printf 'gone'
+    fi
+    return 0
+  fi
   [[ -n $dir ]] || return 0
-  if found=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+  if found=$(common_of "$dir"); then
     if [[ $found == "$common" ]]; then printf 'live'; fi
     return 0
   fi
@@ -680,11 +1003,13 @@ stack_kind() {
 }
 
 list_stacks() {
-  local common repo project dir kind ncpu memtotal age=-1 lower disk_projects=/dev/null disk_totals=/dev/null cache
+  local common='' repo='' project dir kind ncpu memtotal age=-1 lower disk_projects=/dev/null disk_totals=/dev/null cache
   WTREE_TMP=$(mktemp -d)
   trap 'rm -rf "$WTREE_TMP"' EXIT
-  common=$(git rev-parse --path-format=absolute --git-common-dir)
-  repo=$(basename "$(main_worktree)" | tr '[:upper:]' '[:lower:]')
+  if ! is_global; then
+    common=$(common_of "$PWD")
+    repo=$(basename "$(main_worktree)" | tr '[:upper:]' '[:lower:]')
+  fi
   cache=$(cache_dir)
 
   docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}\t{{.ID}}' >"$WTREE_TMP/ps"
@@ -693,11 +1018,17 @@ list_stacks() {
   ncpu=$(docker info --format '{{.NCPU}}')
   memtotal=$(docker info --format '{{.MemTotal}}')
 
-  git worktree list --porcelain | awk '
+  list_repos "$(cut -f2 "$WTREE_TMP/ps")" | worktree_stream | awk '
+    function basename_of(p) { sub(/\/$/, "", p); sub(/.*\//, "", p); return p }
+    /^repo /     { first = 1; next }
     /^worktree / { path = substr($0, 10); ref = "" }
     /^branch /   { ref = substr($0, 8); sub(/^refs\/heads\//, "", ref) }
     /^detached/  { ref = "(detached)" }
-    /^$/ { printf "%s\t%s\n", path, ref }' >"$WTREE_TMP/worktrees"
+    /^$/ {
+      if (first) { name = basename_of(path); sub(/\.git$/, "", name) }
+      first = 0
+      printf "%s\t%s\t%s\n", path, ref, name
+    }' >"$WTREE_TMP/worktrees"
   : >"$WTREE_TMP/members"
   while IFS=$'\037' read -r project dir; do
     kind=$(stack_kind "$project" "$dir" "$common" "$repo")
@@ -705,7 +1036,7 @@ list_stacks() {
   done < <(awk -F'\t' '!seen[$1 FS $2]++ { print $1 "\037" $2 }' "$WTREE_TMP/ps")
   while read -r project; do
     lower=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]')
-    if [[ $lower == "$repo" || $lower == "$repo"-* ]] && ! cut -f1 "$WTREE_TMP/ps" | grep -Fxq "$project"; then
+    if { is_global || [[ $lower == "$repo" || $lower == "$repo"-* ]]; } && ! cut -f1 "$WTREE_TMP/ps" | grep -Fxq "$project"; then
       printf '%s\tvolumes\t\n' "$project" >>"$WTREE_TMP/members"
     fi
   done < <(sort -u "$WTREE_TMP/volumes")
@@ -716,7 +1047,7 @@ list_stacks() {
     age=$((($(date +%s) - $(date -r "$disk_totals" +%s)) / 60))
   fi
 
-  awk -F'\t' -v home="$HOME" -v cols="$(term_cols)" -v ncpu="$ncpu" -v memtotal="$memtotal" -v age="$age" -v busy="$([[ -d $cache/lock ]] && echo 1 || echo 0)" \
+  awk -F'\t' -v global="${WTREE_GLOBAL:-}" -v home="$HOME" -v cols="$(term_cols)" -v ncpu="$ncpu" -v memtotal="$memtotal" -v age="$age" -v busy="$([[ -d $cache/lock ]] && echo 1 || echo 0)" \
     -v worktreesf="$WTREE_TMP/worktrees" -v statsf="$WTREE_TMP/stats" -v membersf="$WTREE_TMP/members" -v psf="$WTREE_TMP/ps" -v volumesf="$WTREE_TMP/volumes" -v diskf="$disk_projects" -v totalsf="$disk_totals" '
     function bytes(s, n, u) {
       n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
@@ -735,7 +1066,7 @@ list_stacks() {
       if (b >= 1e6) return sprintf("%.0fMB", b / 1e6)
       return sprintf("%.0fkB", b / 1e3)
     }
-    FILENAME == worktreesf { wn++; wp[wn] = $1; wr[wn] = $2; next }
+    FILENAME == worktreesf { wn++; wp[wn] = $1; wr[wn] = $2; wo[wn] = $3; next }
     FILENAME == statsf { cpu[$1] = $2 + 0; split($3, m, " / "); mem[$1] = bytes(m[1]); allcpu += cpu[$1]; allmem += mem[$1]; next }
     FILENAME == membersf { if (!($1 in kind) || $2 == "live") { kind[$1] = $2; dir[$1] = $3 } next }
     FILENAME == psf { if ($1 in kind) { n[$1, $3]++; pcpu[$1] += cpu[$4]; pmem[$1] += mem[$4] } next }
@@ -757,11 +1088,11 @@ list_stacks() {
         for (i = 1; i <= count; i++) if ((p, st[i]) in n) state = state (state == "" ? "" : ", ") st[i] " " n[p, st[i]]
         if (state == "") state = "no containers"
         note = kind[p] == "gone" ? "  \033[33mworktree gone\033[0m" : kind[p] == "volumes" ? "  \033[33mvolumes only\033[0m" : ""
-        branch = ""; bestlen = 0
+        branch = ""; owner = ""; bestlen = 0
         for (j = 1; j <= wn; j++) {
-          if ((dir[p] == wp[j] || index(dir[p], wp[j] "/") == 1) && length(wp[j]) > bestlen) { branch = wr[j]; bestlen = length(wp[j]) }
+          if ((dir[p] == wp[j] || index(dir[p], wp[j] "/") == 1) && length(wp[j]) > bestlen) { branch = wr[j]; owner = wo[j]; bestlen = length(wp[j]) }
         }
-        on = branch == "" ? "" : "\033[35mon " branch "\033[0m"
+        on = branch == "" ? "" : "\033[35mon " (global != "" ? owner " " : "") branch "\033[0m"
         shown = dir[p]
         if (index(shown, home "/") == 1) shown = "~" substr(shown, length(home) + 1)
         usage = (((p, "running") in n) ? sprintf("CPU %.1f%%  memory %s  ", pcpu[p], mem_text(pmem[p])) : "") "disk " ((p in disk) ? disk_text(disk[p]) : "?") "  volumes " (vols[p] + 0)
@@ -780,47 +1111,158 @@ list_stacks() {
     sort | cut -f3- | tr '\n\037' '\0\n'
 }
 
-stop_stack() {
-  if ! docker compose -p "$1" stop; then pause; fi
-}
-
-delete_stack() {
-  local project=$1 dir=$2 with_volumes=${3:-} main count answer
-  if [[ -z $project ]]; then return 0; fi
-  if [[ -z $with_volumes ]]; then
-    printf 'Delete the containers and networks of %s? The volumes stay. [y/N] ' "$project"
-    read -r -n1 answer </dev/tty || answer=n
-    printf '\n'
-    [[ $answer == y || $answer == Y ]] || return 0
-  else
-    main=$(main_worktree)
-    count=$(docker volume ls -q --filter "label=com.docker.compose.project=$project" | wc -l | tr -d ' ')
-    if [[ $dir == "$main" || $dir == "$main"/* ]]; then
-      printf 'This stack belongs to the main checkout.\nThe %s volumes of %s and their data are lost.\nType the stack name to delete: ' "$count" "$project"
-      read -r answer </dev/tty || answer=
-      [[ $answer == "$project" ]] || return 0
-    else
-      printf 'Delete %s and its %s volumes? The data in the volumes is lost. [y/N] ' "$project" "$count"
-      read -r -n1 answer </dev/tty || answer=n
-      printf '\n'
-      [[ $answer == y || $answer == Y ]] || return 0
-    fi
-  fi
-  stack_down "$project" "$with_volumes" || return 0
-  propose_worktree "$dir"
+# compose reads a compose file in the directory, so a stack from another directory needs none there
+compose() {
+  (
+    unset COMPOSE_FILE
+    cd / && docker compose "$@"
+  )
 }
 
 stack_down() {
   local project=$1 with_volumes=${2:-} volume
-  if ! docker compose -p "$project" down; then
-    pause
-    return 1
-  fi
+  compose -p "$project" down
   if [[ -n $with_volumes ]]; then
     for volume in $(docker volume ls -q --filter "label=com.docker.compose.project=$project"); do
-      if ! docker volume rm "$volume"; then pause; fi
+      docker volume rm "$volume"
     done
   fi
+}
+
+# a stack without a linked worktree can hold the only copy of its data
+stack_is_protected() {
+  local dir=$1 main
+  [[ -n $dir && -d $dir ]] || return 1
+  main=$(main_of "$dir")
+  [[ -z $main || $dir == "$main" || $dir == "$main"/* ]]
+}
+
+stop_stacks() {
+  local project
+  (($# > 0)) || return 0
+  if (($# > 1)); then
+    printf 'Stop %s:\n' "$(plural "$#" 'stack')"
+    for project in "$@"; do printf '  %s\n' "$project"; done
+    confirm 'Continue?' || return 0
+  fi
+  for project in "$@"; do add_step '' "stop stack $project" compose -p "$project" stop; done
+  run_steps || true
+}
+
+# args: with_volumes, then the stacks, then the directory of each stack
+delete_stacks() {
+  local with_volumes=$1
+  shift
+  local count=$(($# / 2)) i k n=0 project dir current wt common main risk seen=' ' volumes=0 found phrase with_worktrees='' answer after
+  ((count > 0)) || return 0
+  local all_projects=("${@:1:count}") all_dirs=("${@:count+1}")
+  local projects=() dirs=() counts=() protected=() wt_path=() wt_common=() wt_keep=() owner=()
+  current=$(git rev-parse --show-toplevel 2>/dev/null) || current=
+  for ((i = 0; i < count; i++)); do
+    if [[ -z ${all_projects[i]} ]]; then continue; fi
+    n=${#projects[@]}
+    projects[n]=${all_projects[i]}
+    dirs[n]=${all_dirs[i]}
+    owner[n]=-1
+    counts[n]=0
+    dir=${dirs[n]}
+    if [[ -n $with_volumes ]]; then
+      counts[n]=$(docker volume ls -q --filter "label=com.docker.compose.project=${projects[n]}" | wc -l | tr -d ' ')
+      volumes=$((volumes + counts[n]))
+      if stack_is_protected "$dir"; then protected[${#protected[@]}]=${projects[n]}; fi
+    fi
+    [[ -n $dir && -d $dir ]] || continue
+    wt=$(worktree_of "$dir" "$dir")
+    main=$(main_of "$dir")
+    [[ -n $wt && $wt != "$main" && $wt != "$current" ]] || continue
+    common=$(common_of "$dir") || continue
+    found=-1
+    for ((k = 0; k < ${#wt_path[@]}; k++)); do
+      if [[ ${wt_path[k]} == "$wt" ]]; then found=$k; fi
+    done
+    if ((found >= 0)); then
+      owner[n]=$found
+      continue
+    fi
+    risk=$(worktree_risk "$wt" "$common")
+    if [[ -n $risk ]]; then
+      if [[ $seen != *" $wt "* ]]; then
+        seen="$seen$wt "
+        wt_keep[${#wt_keep[@]}]="$(basename "$wt"): $risk"
+      fi
+      continue
+    fi
+    k=${#wt_path[@]}
+    wt_path[k]=$wt
+    wt_common[k]=$common
+    owner[n]=$k
+  done
+  n=${#projects[@]}
+  ((n > 0)) || return 0
+
+  if [[ -n $with_volumes ]]; then
+    printf 'Delete %s and %s:\n' "$(plural "$n" 'stack')" "$(plural "$volumes" 'volume')"
+    for ((i = 0; i < n; i++)); do printf '  %s  (%s)\n' "${projects[i]}" "$(plural "${counts[i]}" 'volume')"; done
+    printf 'The data in the volumes is lost.\n'
+  else
+    printf 'Delete the containers and networks of %s. The volumes stay:\n' "$(plural "$n" 'stack')"
+    for ((i = 0; i < n; i++)); do printf '  %s\n' "${projects[i]}"; done
+  fi
+
+  if ((${#protected[@]} > 0)); then
+    printf 'These stacks belong to a main checkout, or to no repo:\n'
+    for ((i = 0; i < ${#protected[@]}; i++)); do printf '  %s\n' "${protected[i]}"; done
+    printf 'All the worktrees stay.\n'
+    wt_path=()
+  elif ((${#wt_keep[@]} > 0)); then
+    printf 'These worktrees stay:\n'
+    for ((i = 0; i < ${#wt_keep[@]}; i++)); do printf '  %s\n' "${wt_keep[i]}"; done
+  fi
+  if ((${#wt_path[@]} > 0)); then
+    printf 'Worktrees of these stacks:\n'
+    for ((k = 0; k < ${#wt_path[@]}; k++)); do printf '  %s\n' "$(short_path "${wt_path[k]}")"; done
+    printf 'Deleting a worktree also deletes its ignored files, such as .env and node_modules.\n'
+  fi
+  # volume data does not come back, so a stray key must not delete it from several stacks
+  if [[ -n $with_volumes ]] && ((n > 1 || ${#protected[@]} > 0)); then
+    phrase=${projects[0]}
+    if ((n > 1)); then phrase=$(plural "$n" 'stack'); fi
+    if ((${#wt_path[@]} > 0)); then
+      printf 'Type "%s" to delete, or "%s w" to delete the worktrees too: ' "$phrase" "$phrase"
+    else
+      printf 'Type "%s" to delete: ' "$phrase"
+    fi
+    read -r answer </dev/tty || answer=
+    if ((${#wt_path[@]} > 0)) && [[ $answer == "$phrase w" ]]; then
+      with_worktrees=1
+    elif [[ $answer != "$phrase" ]]; then
+      return 0
+    fi
+  elif ((${#wt_path[@]} == 0)); then
+    confirm 'Continue?' || return 0
+  else
+    printf '[y: stacks only, w: and worktrees, N: no] '
+    read_key
+    case $KEY in
+      y | Y) ;;
+      w | W) with_worktrees=1 ;;
+      *) return 0 ;;
+    esac
+  fi
+
+  for ((i = 0; i < n; i++)); do
+    add_step '' "delete stack ${projects[i]}" stack_down "${projects[i]}" "$with_volumes"
+  done
+  if [[ -n $with_worktrees ]]; then
+    for ((k = 0; k < ${#wt_path[@]}; k++)); do
+      after=
+      for ((i = 0; i < n; i++)); do
+        if ((owner[i] == k)); then after="$after $i"; fi
+      done
+      add_step "$after" "delete worktree $(basename "${wt_path[k]}")" remove_worktree "${wt_path[k]}" "${wt_common[k]}"
+    done
+  fi
+  run_steps || true
   refresh_disk
 }
 
@@ -828,79 +1270,120 @@ pick_stack() {
   require_fzf
   command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
   docker info >/dev/null 2>&1 || die "Docker is not running"
-  local selected project dir action layout=(--height=80% --header=$'enter: open   ctrl-s: stop   ctrl-d: delete   ctrl-f: delete with volumes\nctrl-r: reload   esc: quit')
+  local selected count title action tap='' layout
   export WTREE_SELF=$0
   if disk_is_old; then refresh_disk; fi
-  if is_narrow; then
-    layout=(--height=100% --no-scrollbar --bind='left-click:accept' --header=$'enter: menu   ctrl-r: reload   esc: quit')
-  fi
   while :; do
-    selected=$("$WTREE_SELF" --stack-list | SHELL=$(command -v bash) fzf \
-      --read0 --ansi --highlight-line --header-lines=2 \
+    layout=(--height=80% --header=$'tab: select   ctrl-a: select all   enter: open   ctrl-s: stop\nctrl-d: delete   ctrl-f: delete with volumes   ctrl-r: reload   esc: quit')
+    if [[ -n $tap ]]; then
+      layout=(--height=100% --no-scrollbar --bind='left-click:toggle' --header=$'tap: select   enter: actions   esc: quit')
+    elif is_narrow; then
+      layout=(--height=100% --no-scrollbar --bind='left-click:accept' --header=$'enter: menu   tab: select\nctrl-r: reload   esc: quit')
+    fi
+    selected=$(: | SHELL=$(command -v bash) fzf \
+      --read0 --print0 --multi --ansi --highlight-line --header-lines=2 \
       --layout=reverse --info=inline \
-      --prompt='stack > ' \
+      --prompt="$(is_global && printf 'all stacks' || printf 'stack') > " \
       --delimiter=$'\t' --with-nth=3 \
       "${layout[@]}" \
-      --bind='ctrl-s:execute("$WTREE_SELF" --stack-stop {1})+reload("$WTREE_SELF" --stack-list)' \
-      --bind='ctrl-d:execute("$WTREE_SELF" --stack-delete {1} {2})+reload("$WTREE_SELF" --stack-list)' \
-      --bind='ctrl-f:execute("$WTREE_SELF" --stack-purge {1} {2})+reload("$WTREE_SELF" --stack-list)' \
-      --bind='ctrl-r:reload("$WTREE_SELF" --stack-list)') || {
+      --bind='start:reload("$WTREE_SELF" --stack-list)' \
+      --bind='ctrl-a:toggle-all' \
+      --bind='ctrl-s:execute("$WTREE_SELF" --stack-stop {+1})+reload("$WTREE_SELF" --stack-list)' \
+      --bind='ctrl-d:execute("$WTREE_SELF" --stack-delete {+1} {+2})+reload("$WTREE_SELF" --stack-list)' \
+      --bind='ctrl-f:execute("$WTREE_SELF" --stack-purge {+1} {+2})+reload("$WTREE_SELF" --stack-list)' \
+      --bind='ctrl-r:reload("$WTREE_SELF" --stack-list)' | tr '\0' '\036') || {
       fzf_exit $?
       continue
     }
-    project=${selected%%$'\t'*}
-    dir=${selected#*$'\t'}
-    dir=${dir%%$'\t'*}
-    if is_narrow; then
-      action=$(menu "$project" open stop 'delete, keep volumes' 'delete with volumes' back) || continue
+    split_selection "$selected"
+    count=${#PICKED_1[@]}
+    ((count > 0)) || continue
+    if [[ -z $tap ]] && ! is_narrow; then
+      open_many "${PICKED_2[@]}"
+      return 0
+    fi
+    tap=
+    if ((count == 1)); then
+      title=${PICKED_1[0]}
+      action=$(menu "$title" open stop 'delete, keep volumes' 'delete with volumes' 'select several' back) || continue
     else
-      action=open
+      title=$(plural "$count" 'stack')
+      action=$(menu "$title" open stop 'delete, keep volumes' 'delete with volumes' back) || continue
     fi
     case $action in
       open)
-        [[ -n $dir ]] || die "this stack has no directory"
-        open_tab "$dir"
+        open_many "${PICKED_2[@]}"
         return 0
         ;;
-      stop) stop_stack "$project" ;;
-      'delete, keep volumes') delete_stack "$project" "$dir" ;;
-      'delete with volumes') delete_stack "$project" "$dir" volumes ;;
+      stop) stop_stacks "${PICKED_1[@]}" ;;
+      'delete, keep volumes') delete_stacks '' "${PICKED_1[@]}" "${PICKED_2[@]}" ;;
+      'delete with volumes') delete_stacks volumes "${PICKED_1[@]}" "${PICKED_2[@]}" ;;
+      'select several') tap=1 ;;
     esac
   done
 }
 
 # bash reads a script while it runs, so load all of it before the first command
 main() {
-  local mode
-  mode=${1:-}
+  local mode=''
+  while (($#)); do
+    case $1 in
+      -g | --global) export WTREE_GLOBAL=1 ;;
+      -gd | -dg)
+        export WTREE_GLOBAL=1
+        mode=-d
+        ;;
+      -d | --docker | -n | --new | -h | --help)
+        [[ -z $mode ]] || die "use one of -n and -d"
+        mode=$1
+        ;;
+      *) break ;;
+    esac
+    shift
+  done
+  if [[ -n $mode ]]; then
+    (($# == 0)) || die "unknown argument: $1"
+  else
+    mode=${1:-}
+    if (($#)); then shift; fi
+  fi
   case $mode in
     -h | --help)
       usage
       exit 0
       ;;
-    "" | -n | --new | --list | -d | --docker | --stack-list) (($# <= 1)) || die "unknown argument: $2" ;;
-    --stack-stop) (($# == 2)) || die "$mode needs one stack" ;;
-    --stack-delete | --stack-purge) (($# == 3)) || die "$mode needs a stack and a directory" ;;
-    --delete | --force-delete) (($# == 2)) || die "$mode needs one path" ;;
+    -n | --new)
+      if is_global; then die "-n creates a worktree in this repo, so it does not work with -g"; fi
+      ;;
+    "" | -d | --docker | --list | --rescan | --stack-list) (($# == 0)) || die "unknown argument: $1" ;;
+    --stack-stop) (($# > 0)) || die "$mode needs a stack" ;;
+    --stack-delete | --stack-purge) (($# % 2 == 0)) || die "$mode needs a directory for each stack" ;;
+    --delete | --force-delete) (($# % 2 == 0)) || die "$mode needs a repo for each path" ;;
     *)
       usage >&2
       die "unknown argument: $mode"
       ;;
   esac
 
-  git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $PWD"
+  if ! is_global; then
+    git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $PWD"
+  fi
 
   case $mode in
     "") pick_worktree ;;
     -n | --new) new_worktree ;;
     --list) list_worktrees ;;
-    --delete) delete_worktree "$2" ;;
-    --force-delete) delete_worktree "$2" force ;;
+    --rescan)
+      if is_global; then rescan_repos; fi
+      list_worktrees
+      ;;
+    --delete) delete_worktrees '' "$@" ;;
+    --force-delete) delete_worktrees force "$@" ;;
     -d | --docker) pick_stack ;;
     --stack-list) list_stacks ;;
-    --stack-stop) stop_stack "$2" ;;
-    --stack-delete) delete_stack "$2" "$3" ;;
-    --stack-purge) delete_stack "$2" "$3" volumes ;;
+    --stack-stop) stop_stacks "$@" ;;
+    --stack-delete) delete_stacks '' "$@" ;;
+    --stack-purge) delete_stacks volumes "$@" ;;
   esac
 }
 
