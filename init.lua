@@ -3,6 +3,8 @@
 --   rex.bind("ctrl+space>w", "wtree")
 --   rex.bind("ctrl+space>n", "wtree_new")
 --   rex.bind("ctrl+space>d", "wtree_docker")
+--   rex.bind("ctrl+space>g", "wtree_global")
+--   rex.bind("ctrl+space>s", "wtree_docker_global")
 
 local M = {}
 
@@ -113,6 +115,24 @@ function M.setup(opts)
     category    = "wtree",
     keywords    = "docker compose stack container",
     run = function(ctx) return open_float(ctx, { "-d" }, "wtree docker") end,
+  }
+
+  rex.action{
+    name        = "wtree_global",
+    title       = "wtree: All Worktrees…",
+    description = "Search all the worktrees on this machine. Open or delete worktrees.",
+    category    = "wtree",
+    keywords    = "git worktree branch global machine",
+    run = function(ctx) return open_float(ctx, { "-g" }, "wtree all") end,
+  }
+
+  rex.action{
+    name        = "wtree_docker_global",
+    title       = "wtree: All Docker Stacks…",
+    description = "Search all the Docker Compose stacks on this machine, with usage. Stop or delete stacks.",
+    category    = "wtree",
+    keywords    = "docker compose stack container global machine",
+    run = function(ctx) return open_float(ctx, { "-g", "-d" }, "wtree docker all") end,
   }
 
   return M
