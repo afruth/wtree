@@ -217,9 +217,13 @@ func TestLevelAsksForANewPlanAndNeverStaysSelected(t *testing.T) {
 	}
 	h.expect("force delete")
 	// the next sheet starts mild again
+	before := len(h.calls("plan"))
 	h.key("backspace", "d")
-	if last := h.calls("plan"); hasArgs(last[len(last)-1].Args, "--force") {
+	if next := h.calls("plan")[before]; hasArgs(next.Args, "--force") {
 		t.Fatal("force stayed selected from the last run")
+	}
+	if h.m.confirm.Plan.Flags.Force {
+		t.Fatal("the new sheet shows force")
 	}
 }
 
@@ -1709,7 +1713,7 @@ func TestMixedMarksMakeTwoPlansEachWithItsSheet(t *testing.T) {
 		t.Fatalf("the stacks first: %s", h.m.confirm.Plan.Action)
 	}
 	h.key("y")
-	if len(h.calls("plan")) != 1 {
+	if len(h.calls("plan:"+core.ActionDeleteWorktrees)) != 0 {
 		t.Fatal("the next plan is asked for when the first has ended and was read")
 	}
 	h.key("enter")

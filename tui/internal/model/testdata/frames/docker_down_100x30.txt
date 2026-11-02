@@ -1,4 +1,4 @@
- wtree  ▌repo proj▐ machine   2 worktrees                                                    ? help
+ wtree   g  repo proj  machine   2 worktrees                                                ? help
  docker is not running · r retry
     NAME        BRANCH           GIT     STACK     CPU   MEM  DISK AGE
   @ proj        main                                               1h

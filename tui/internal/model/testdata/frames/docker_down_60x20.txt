@@ -1,4 +1,4 @@
- wtree  ▌repo proj▐ machine   2 wt
+ wtree   g  repo proj  machine   2 wt
  docker is not running · r retry
     NAME        BRANCH       STACK         CPU   MEM   DISK
   @ proj        main

@@ -42,14 +42,15 @@ func (m *Model) onKey(msg tea.KeyPressMsg) tea.Cmd {
 	// not open over what the user does next, and take the keys of that as its answer.
 	if m.planWaiting() {
 		switch k {
-		case "d", "D", "s", "n":
-			return nil // the status line says that it is on its way
 		case "backspace", "esc":
-			m.cancelPlan()
 			m.holdKey(k)
-			return m.say("cancelled", theme.ToneDim)
+			return m.cancelWait()
+		case "q", "ctrl+c":
+			m.cancelPlan() // and on to quit
+		default:
+			m.ignoredWhileWaiting = true
+			return nil // the sheet says what comes; only cancel acts
 		}
-		m.cancelPlan()
 	}
 	mode, typing := m.mode, m.confirm.Typing
 	cmd := m.dispatchKey(msg, k)
@@ -476,18 +477,7 @@ func (m *Model) pickOption(o dialog.Option) tea.Cmd {
 		c.Choice = o.Index
 		return nil
 	}
-	if o.Selected {
-		return nil
-	}
-	req := c.Req
-	switch c.Plan.Action {
-	case "delete-worktrees":
-		req.Force = o.Index == 1
-	case "delete-stacks":
-		req.Volumes = o.Index == 1
-	}
-	c.Busy = true
-	return m.planCmd(req, true)
+	return m.pickLevel(o)
 }
 
 // unmarkHidden takes the marks under HIDDEN BY FILTER out of the plan, and asks again: another
@@ -532,7 +522,7 @@ func (m *Model) unmarkHidden() tea.Cmd {
 	if len(req.Targets) == 0 {
 		return m.cancelConfirm()
 	}
-	c.Busy = true
+	c.Busy, c.BusyLevel = true, -1
 	return m.planCmd(req, true)
 }
 

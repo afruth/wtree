@@ -1940,3 +1940,57 @@ test_core_plan_does_not_say_only_volumes_when_docker_did_not_answer() {
   plan_ok delete-stacks -- lonely
   assert_eq "$(q 'item("stack:lonely").get("only_volumes")')" null
 }
+
+# ---- containers that compose did not start
+
+# A container run from an image that compose built carries the project label, and compose down
+# and stop pass it by. Found on a real host: the stack stayed in the list after each delete,
+# and the core said ok.
+stray_stack() {
+  make_repo
+  add_wt alpha
+  stack p "$WT" exited
+  stack p "$WT" "${1:-exited}"
+  printf 'id1\n' >"$WTREE_SHIM_DIR/strays"
+}
+
+test_core_delete_stack_removes_a_container_compose_did_not_start() {
+  stray_stack
+  plan_ok delete-stacks -- p
+  apply_ok delete-stacks "$PLAN_ID_OF" --choice stacks -- p
+  assert_rc 0
+  assert_log "compose -p p down"
+  assert_log "rm -f id1"
+  if grep -q "^p	" "$WTREE_SHIM_DIR/containers"; then fail "a container of p is left"; fi
+  assert_q 'lines[-1]["ok"]' 1
+}
+
+test_core_delete_stack_fails_when_a_stray_container_stays() {
+  stray_stack
+  shim_fail 'rm -f *' 'cannot remove'
+  plan_ok delete-stacks -- p
+  apply_ok delete-stacks "$PLAN_ID_OF" --choice stacks -- p
+  assert_q 'lines[-1]["ok"]' 0
+  assert_q 'lines[-1]["failed"]' 1
+}
+
+test_core_stop_stack_stops_a_running_container_compose_did_not_start() {
+  stray_stack running
+  plan_ok stop-stacks -- p
+  apply_ok stop-stacks "$PLAN_ID_OF" -- p
+  assert_rc 0
+  assert_log "compose -p p stop"
+  assert_log "stop id1"
+  if grep -q "running" "$WTREE_SHIM_DIR/containers"; then fail "a container of p still runs"; fi
+}
+
+test_core_delete_stack_without_strays_calls_no_rm() {
+  make_repo
+  add_wt alpha
+  stack p "$WT" exited
+  plan_ok delete-stacks -- p
+  apply_ok delete-stacks "$PLAN_ID_OF" --choice stacks -- p
+  assert_rc 0
+  assert_not_log "rm -f id0"
+  assert_q 'lines[-1]["ok"]' 1
+}

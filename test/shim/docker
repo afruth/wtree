@@ -5,6 +5,8 @@
 #   containers  project, working dir, state, id, cpu, memory (tab separated). <TAB> in the working dir
 #               stands for a tab in its name
 #   volumes     volume, project (tab separated)
+#   strays      container ids that carry a project label but that compose did not start, so
+#               compose down and stop pass them by, as with a container run from a built image
 #   known       projects that existed, because a label query on an empty project is still valid
 #   meta        container id, service, status, ports, started at, finished at, name (tab separated).
 #               Without a row, a container gets plain values
@@ -243,14 +245,35 @@ do_compose() {
   printf '%s\n' "$2" >>"$DIR/known"
   case $3 in
     down)
-      awk -F'\t' -v p="$2" '$1 != p' "$DIR/containers" >"$DIR/containers.new"
+      awk -F'\t' -v p="$2" 'FNR == NR { stray[$1] = 1; next } $1 != p || stray[$4]' "$DIR/strays_or_none" "$DIR/containers" >"$DIR/containers.new"
       ;;
     stop)
-      awk -F'\t' -v OFS='\t' -v p="$2" '$1 == p { $3 = "exited" } { print }' "$DIR/containers" >"$DIR/containers.new"
+      awk -F'\t' -v OFS='\t' -v p="$2" 'FNR == NR { stray[$1] = 1; next } $1 == p && !stray[$4] { $3 = "exited" } { print }' "$DIR/strays_or_none" "$DIR/containers" >"$DIR/containers.new"
       ;;
     *) refuse ;;
   esac
   mv "$DIR/containers.new" "$DIR/containers"
+}
+
+# rm -f and stop, by the ids of the fixture only
+do_by_id() {
+  local how=$1 id
+  shift
+  if [[ $how == rm ]]; then
+    [[ ${1:-} == -f ]] || refuse
+    shift
+  fi
+  (($# > 0)) || refuse
+  for id in "$@"; do
+    awk -F'\t' -v id="$id" '$4 == id { found = 1 } END { exit !found }' "$DIR/containers" || refuse
+  done
+  if [[ $how == rm ]]; then
+    awk -F'\t' 'FNR == NR { gone[$1] = 1; next } !gone[$4]' <(printf '%s\n' "$@") "$DIR/containers" >"$DIR/containers.new"
+  else
+    awk -F'\t' -v OFS='\t' 'FNR == NR { gone[$1] = 1; next } gone[$4] { $3 = "exited" } { print }' <(printf '%s\n' "$@") "$DIR/containers" >"$DIR/containers.new"
+  fi
+  mv "$DIR/containers.new" "$DIR/containers"
+  printf '%s\n' "$@"
 }
 
 if [[ $CALL == --wtree-shim-id ]]; then
@@ -285,7 +308,13 @@ case $command in
     ;;
   compose)
     shift
+    # awk reads it as the first file, so it is never empty: one line that no id matches
+    { printf -- '-\n'; [[ ! -f $DIR/strays ]] || cat "$DIR/strays"; } >"$DIR/strays_or_none"
     do_compose "$@"
+    ;;
+  rm | stop)
+    shift
+    do_by_id "$command" "$@"
     ;;
   *) refuse ;;
 esac

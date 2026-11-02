@@ -264,7 +264,10 @@ func (m *Model) overlay() *dialog.Frame {
 	case ModePanel:
 		f = m.info.Render(m.th, m.layout)
 	default:
-		return nil
+		if !m.planWaiting() {
+			return nil
+		}
+		f = m.waitSheet().Render(m.th, m.layout)
 	}
 	return &f
 }
@@ -415,35 +418,48 @@ func (m *Model) repoSegmentText() string {
 	return "repo " + treetable.Sanitize(m.repoName)
 }
 
+// segments is the scope control: the key g, then the two scopes, each a block like the buttons
+// of the bar, so that it reads as a control and not as a title. The chosen one is in accent.
+// A tap on g switches, a tap on a scope picks it.
 func (m *Model) segments(x int) (string, []dialog.Zone) {
 	g := m.th.G
-	draw := func(text string, on bool) string {
-		if on {
-			if m.th.ASCII {
+	draw := func(text string, on, off bool) string {
+		if m.th.ASCII {
+			if on {
 				return m.th.Bold(theme.ToneAccent).Render(g.ScopeOpen + text + g.ScopeClose)
 			}
-			edge := m.th.Style(theme.ToneAccent)
-			return edge.Render(g.ScopeOpen) + m.th.Button(theme.ToneAccent).Bold(true).Render(text) + edge.Render(g.ScopeClose)
+			return m.th.Style(theme.ToneFg).Render(" " + text + " ")
 		}
-		tone := theme.ToneFg
-		if strings.Contains(text, "repo") && m.noRepo {
-			tone = theme.ToneDim
+		switch {
+		case on:
+			return m.th.Button(theme.ToneAccent).Bold(true).Render(" " + text + " ")
+		case off:
+			return m.th.ButtonOff().Render(" " + text + " ")
 		}
-		return m.th.Style(tone).Render(" " + text + " ")
+		return m.th.Button(theme.ToneDim).Render(" " + text + " ")
+	}
+	key := m.th.Button(theme.ToneDim).Bold(true).Render(" g")
+	if m.th.ASCII {
+		key = m.th.Bold(theme.ToneAccent).Render("g ")
 	}
 	repoText, machine := m.repoSegmentText(), "machine"
 	if repoText == "repo" {
 		repoText = " repo " // each segment is a target of at least 8 cells
 	}
-	repo := draw(repoText, !m.machine())
-	mach := draw(machine, m.machine())
-	rw, mw := ansi.StringWidth(repo), ansi.StringWidth(mach)
+	repo := draw(repoText, !m.machine(), m.noRepo)
+	mach := draw(machine, m.machine(), false)
+	sep := m.th.Button(theme.ToneDim).Render(" ")
+	if m.th.ASCII {
+		sep = ""
+	}
+	kw, rw, sw, mw := ansi.StringWidth(key), ansi.StringWidth(repo), ansi.StringWidth(sep), ansi.StringWidth(mach)
 	y := 0
 	zones := []dialog.Zone{
-		{X0: x, Y0: y, X1: x + rw, Y1: y + 1, Action: "scope:repo"},
-		{X0: x + rw, Y0: y, X1: x + rw + mw, Y1: y + 1, Action: "scope:machine"},
+		{X0: x, Y0: y, X1: x + kw + sw, Y1: y + 1, Action: "scope:toggle"},
+		{X0: x + kw + sw, Y0: y, X1: x + kw + sw + rw, Y1: y + 1, Action: "scope:repo"},
+		{X0: x + kw + sw + rw, Y0: y, X1: x + kw + sw + rw + mw, Y1: y + 1, Action: "scope:machine"},
 	}
-	return repo + mach, zones
+	return key + sep + repo + mach, zones
 }
 
 func (m *Model) spinner() string {
@@ -600,7 +616,7 @@ func (m *Model) header() (string, []dialog.Zone) {
 		return joinEnds(line, m.narrowRight(sum, l.Width-ansi.StringWidth(line)-2)+" ", l.Width), zones
 	}
 
-	fg := m.th.Style(theme.ToneFg)
+	fg := dim // numbers are information; only the blocks act
 	var parts []headerPart
 	wtWord := " worktrees"
 	if sum.Worktrees == 1 {
@@ -639,7 +655,7 @@ func (m *Model) header() (string, []dialog.Zone) {
 	}
 	helpOn := l.Tier == theme.TierWide
 	if helpOn {
-		parts = append(parts, headerPart{text: dim.Render("? help"), right: true, drop: 9})
+		parts = append(parts, headerPart{text: m.th.Button(theme.ToneDim).Bold(true).Render(" ?") + m.th.Button(theme.ToneDim).Render(" help "), right: true, drop: 9})
 	}
 	dot := dim.Render(" " + m.th.G.Dot + " ")
 	build := func(ps []headerPart) (string, string) {
@@ -661,7 +677,7 @@ func (m *Model) header() (string, []dialog.Zone) {
 		left, right := build(parts)
 		if ansi.StringWidth(left)+1+ansi.StringWidth(right) <= l.Width || len(parts) == 0 {
 			if helpOn && strings.Contains(ansi.Strip(right), "? help") {
-				zones = append(zones, dialog.Zone{X0: l.Width - 7, Y0: 0, X1: l.Width, Y1: 1, Action: "help"})
+				zones = append(zones, dialog.Zone{X0: l.Width - 9, Y0: 0, X1: l.Width, Y1: 1, Action: "help"})
 			}
 			return joinEnds(left, right, l.Width), zones
 		}

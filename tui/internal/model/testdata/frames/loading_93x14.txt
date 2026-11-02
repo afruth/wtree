@@ -1,4 +1,4 @@
- wtree ▌ repo ▐ machine    STACK           CPU   DISK
+ wtree  g   repo   machine    STACK           CPU   DISK
    loading worktrees…
 
 

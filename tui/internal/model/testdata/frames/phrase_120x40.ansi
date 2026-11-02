@@ -1,4 +1,4 @@
-[38;2;122;119;110m wtree  ▌repo proj▐ machine   7 worktrees · 4 stacks · cleanup ~1K                          live now · disk 1m · ? help [m
+[38;2;122;119;110m wtree   g  repo proj  machine   7 worktrees · 4 stacks · cleanup ~1K                     live now · disk 1m ·  ? help  [m
 [38;2;122;119;110m    NAME        BRANCH            GIT     STACK     CPU   MEM  DISK AGE            │ proj-gone                          [m
 [38;2;122;119;110m  @ proj        main                                                1h             │ ~/nowhere                          [m
 [38;2;122;119;110m  ▸ alpha                                 1/2      2.5%  200M  3.0G 1h             │ worktree gone 0/1                  [m

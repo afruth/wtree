@@ -1,4 +1,4 @@
- wtree  ▌repo proj▐ machine   7 wt · cleanup ~1K
+ wtree   g  repo proj  machine   7 wt · cleanup ~1K
   ┌─ help · medium 60x20 · unicode · dark · hides AGE ───┐
   │ j k       move                                       │
   │ enter     open or jump                               │

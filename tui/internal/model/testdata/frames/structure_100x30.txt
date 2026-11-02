@@ -1,4 +1,4 @@
- wtree  ▌repo proj▐ machine   7 worktrees · 4 stacks                              loading… · ? help
+ wtree   g  repo proj  machine   7 worktrees · 4 stacks                         loading… ·  ? help
     NAME        BRANCH            GIT     STACK     CPU   MEM  DISK AGE
   @ proj        main              ·                                 ·
   ▸ alpha                         ·       1/2         ·     ·     · ·

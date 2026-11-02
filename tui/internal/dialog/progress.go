@@ -54,6 +54,7 @@ type Progress struct {
 	End        *core.EndEvent
 	Err        string // the stream did not end as the contract says
 	Log        []string
+	Next       string // the part of the batch that comes after this one: "15 worktrees · part 2 of 2"
 }
 
 // NewProgress prepares the rows from the choice of the plan: the steps it runs, then the
@@ -452,7 +453,12 @@ func (p Progress) Render(th theme.Theme, l theme.Layout) Frame {
 		if p.End != nil && p.End.DiskRefresh {
 			foot = append(foot, textRow(th.Style(theme.ToneDim).Render(treetable.TruncateEnd("disk sizes update in the background", inner, ell))))
 		}
-		a, b := button(th, "L log", theme.ToneDim, false), button(th, "enter back", theme.ToneAccent, true)
+		back := "enter back"
+		if p.Next != "" {
+			foot = append(foot, textRow(th.Bold(theme.ToneAccent).Render(treetable.TruncateEnd("next: "+p.Next, inner, ell))))
+			back = "enter next"
+		}
+		a, b := button(th, "L log", theme.ToneDim, false), button(th, back, theme.ToneAccent, true)
 		ax, bx := 0, Width(a)+2
 		foot = append(foot, Row{Lines: []string{a + "  " + b}, Spans: []Span{{ax, ax + Width(a), "log"}, {bx, bx + Width(b), "close"}}})
 	} else {

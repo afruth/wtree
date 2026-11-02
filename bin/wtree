@@ -26,7 +26,7 @@ REPO_SCAN_WAIT=3
 # days after which a stopped stack counts as stale
 STALE_DAYS=7
 
-WTREE_VERSION=0.4.0
+WTREE_VERSION=0.5.0
 # the number that docs/core-contract.md describes. It changes when a field goes or changes its type.
 CORE_CONTRACT=1
 
@@ -1736,7 +1736,7 @@ plan_step_exec() {
       return 1
       ;;
     stack_stop)
-      compose -p "${ITEM_LABEL[item]}" stop
+      stack_stop "${ITEM_LABEL[item]}"
       ;;
     open)
       limited "$OPEN_LIMIT" open_tab "${ITEM_PATH[item]}"
@@ -2278,6 +2278,7 @@ stack_down() {
     fi
   fi
   compose -p "$project" down || return
+  stack_strays_gone "$project" rm || return
   for volume in $volumes; do
     docker volume rm "$volume" || {
       status=$?
@@ -2285,6 +2286,48 @@ stack_down() {
       return "$status"
     }
   done
+}
+
+stack_stop() {
+  compose -p "$1" stop || return
+  stack_strays_gone "$1" stop
+}
+
+# prints the ids of the containers of a project, all of them or only the running ones. args:
+# project, and "running" for those only
+stack_containers() {
+  limited "$DOCKER_READ_LIMIT" docker ps -a --filter label=com.docker.compose.project \
+    --format '{{.Label "com.docker.compose.project"}}\t{{.State}}\t{{.ID}}' 2>/dev/null |
+    awk -F'\t' -v p="$1" -v want="${2:-}" '$1 == p && (want == "" || $2 == want) { print $3 }'
+}
+
+# Compose acts only on the containers that it made. A container started from an image that
+# compose built carries the label of the project too, and wtree lists it with the stack. Left
+# alone it keeps a deleted stack in the list, or a stopped stack running. args: project, rm or stop
+stack_strays_gone() {
+  local project=$1 how=$2 ids status=0 want=''
+  [[ $how == stop ]] && want=running
+  ids=$(stack_containers "$project" "$want") || status=$?
+  if ((status != 0)); then
+    printf '%s, so wtree cannot tell if compose left containers of %s\n' "$(docker_problem "$status")" "$project"
+    return 1
+  fi
+  [[ -n $ids ]] || return 0
+  # shellcheck disable=SC2086 # ids are docker ids, one word each
+  printf 'Compose left %d containers of %s that it did not start: %s\n' "$(wc -w <<<"$ids")" "$project" "$(printf '%s ' $ids)"
+  if [[ $how == rm ]]; then
+    # shellcheck disable=SC2086
+    docker rm -f $ids || return
+  else
+    # shellcheck disable=SC2086
+    docker stop $ids || return
+  fi
+  status=0
+  ids=$(stack_containers "$project" "$want") || status=$?
+  if ((status != 0)) || [[ -n $ids ]]; then
+    printf 'Containers of %s remain: %s\n' "$project" "$(printf '%s ' $ids)"
+    return 1
+  fi
 }
 
 # a stack without a linked worktree can hold the only copy of its data. So can a stack with no known

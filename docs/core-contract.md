@@ -44,7 +44,7 @@ Codes: `usage`, `not_a_repo`, `internal`.
 Run it first. It needs no repo and no Docker. Refuse to start on a `contract` that you do not know.
 
 ```json
-{"v":1,"script":"0.4.0","contract":1}
+{"v":1,"script":"0.5.0","contract":1}
 ```
 
 ## `wtree core list`

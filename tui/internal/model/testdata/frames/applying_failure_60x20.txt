@@ -1,4 +1,4 @@
- wtree  ▌repo proj▐ machine   7 wt · cleanup ~1K
+ wtree   g  repo proj  machine   7 wt · cleanup ~1K
     NAME        BRANCH       STACK         CPU   MEM   DISK
   @ proj        main
   ▸ alpha                    1/2          2.5%  200M   3.0G

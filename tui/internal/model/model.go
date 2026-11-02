@@ -162,17 +162,23 @@ type Model struct {
 	planSeq     int
 	planPending bool
 	planCancel  context.CancelFunc // stops the core plan that runs
-	planSheet   bool               // this plan gets a sheet, also when it could run at once
-	queue       []core.PlanRequest
-	queueTotal  int
-	queuePart   int
-	newSheet    dialog.NewWorktree
-	newPending  bool
-	help        dialog.Help
-	helpReturn  Mode
-	info        dialog.Info
-	logView     dialog.LogView
-	logReturn   Mode
+	planReq     core.PlanRequest   // what the plan on its way is for
+	ahead       *aheadPlan         // the plan of the other level of the sheet
+	aheadSeq    int
+	// ignoredWhileWaiting says that keys or taps came while a plan was read. The user may not
+	// have looked, so its sheet holds longer and says why.
+	ignoredWhileWaiting bool
+	planSheet           bool // this plan gets a sheet, also when it could run at once
+	queue               []core.PlanRequest
+	queueTotal          int
+	queuePart           int
+	newSheet            dialog.NewWorktree
+	newPending          bool
+	help                dialog.Help
+	helpReturn          Mode
+	info                dialog.Info
+	logView             dialog.LogView
+	logReturn           Mode
 
 	// batch
 	progress    dialog.Progress
@@ -339,5 +345,6 @@ func (m *Model) cancelPlan() {
 	}
 	m.planSeq++
 	m.planPending, m.newPending, m.planSheet = false, false, false
+	m.ignoredWhileWaiting = false
 	m.queue, m.queueTotal, m.queuePart = nil, 0, 0
 }
