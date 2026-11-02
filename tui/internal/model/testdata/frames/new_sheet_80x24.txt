@@ -1,0 +1,24 @@
+ wtree  ▌repo proj▐ machine   7 wt · 4 stacks · cleanup ~1K            live now
+    NAME        BRANCH            STACK         CPU   MEM   DISK
+  @ proj        main
+  ▸ alpha                         1/2          2.5%  200M   3.0G
+  ▸ beta ±                        0/1                         1K
+    gamma       (detached) 13563a
+       ┌─ new worktree in proj ─────────────────────────────────────────┐
+       │ name  fresh                                                    │
+       │ /fixture/home/code/worktrees/fresh                             │
+       │ detached at 5acaca25                                           │
+       │                                                                │
+       │ 1 (●) open after creating                                      │
+       │ 2 ( ) stay here                                                │
+       │ digits type into the name · tab moves to the options           │
+       │                                                                │
+       │   backspace clears, then cancels   ▸ enter create              │
+       └────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+                                                                        disk 1m
+  enter open   s stop   d delete   space mark   a actions

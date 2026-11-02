@@ -1,0 +1,24 @@
+ wtree  ▌repo proj▐ machine   7 wt · 4 stacks · cleanup ~1K            live now
+    NAME        BRANCH            STACK         CPU   MEM   DISK
+  @ proj        main
+  ▸ alpha                         1/2          2.5%  200M   3.0G
+  ┌─ delete worktrees · 2 go · 3 stay ───────────────────────────────────────┐
+  │ level (1) delete  (2) force                                              │
+  │ also  (3) worktrees only  (4) and stacks, keep volumes                   │
+  │       (5) and stacks with volumes                                        │
+  │ GOES                                                                     │
+  │   alpha          worktree                                                │
+  │   merged         worktree                                                │
+  │ STAYS                                                                    │
+  │   beta           worktree   it has changed files                         │
+  │   proj           worktree   it is the main checkout                      │
+  │   proj-alpha     stack      choose "and stacks, keep volumes"            │
+  │ Ignored files, such as .env and node_modules, are deleted too.           │
+  │                                                                          │
+  │                           ▸ backspace cancel      y  delete 2 worktrees  │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+
+                                                                        disk 1m
+  enter open   s stop   d delete   space mark   a actions

@@ -1,0 +1,30 @@
+ wtree  ▌repo proj▐ machine   2 worktrees                                                    ? help
+ docker is not running · r retry
+    NAME        BRANCH           GIT     STACK     CPU   MEM  DISK AGE
+  @ proj        main                                               1h
+
+  ! cleanup
+    alpha       merged into main                                   1h
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  enter open   s stop   d delete   space mark   c cleanup   / search   a actions

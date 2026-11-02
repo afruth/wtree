@@ -1,0 +1,40 @@
+ wtree ▌ repo ▐ machine                loading…
+   loading worktrees…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    open       stop      delete    actions
+   enter        s          d          a

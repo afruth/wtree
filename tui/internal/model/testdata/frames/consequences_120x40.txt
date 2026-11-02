@@ -1,0 +1,40 @@
+ wtree  ▌repo proj▐ machine   7 worktrees · 4 stacks · cleanup ~1K                          live now · disk 1m · ? help
+    NAME        BRANCH            GIT     STACK     CPU   MEM  DISK AGE            │ alpha
+  @ proj        main                                                1h             │ ~/code/worktrees/alpha
+  ▸ alpha                                 1/2      2.5%  200M  3.0G 1h             │ alpha
+  ▸ beta                          ±2      0/1                    1K 1h             │ last: more · 1h
+    gamma       (detached) 13563a                                   1h             │
+    locked                        ⚿ ✓                               1h             │ STACKS
+                                                                                   │ ◐ proj-alpha
+  ! cleanup                                                                        │   partial 1/2 · 3.0G
+  ▸  proj-gone  worktree gone     exited  0/1                       4h             │
+     proj-vols  volumes only                                                       │ CONTAINERS
+   ┌─ delete worktrees · 2 go · 3 stay ───────────────────────────────────────┐    │ api  running healthy :8080
+   │ level (1) delete  (2) force                                              │    │ db  exited
+   │ also  (3) worktrees only  (4) and stacks, keep volumes                   │    │
+   │       (5) and stacks with volumes                                        │    │
+   │                                                                          │    │
+   │ GOES                                                                     │    │
+   │   alpha          worktree                                                │    │
+   │   merged         worktree                                                │    │
+   │                                                                          │    │
+   │ STAYS                                                                    │    │
+   │   beta           worktree   it has changed files                         │    │
+   │   proj           worktree   it is the main checkout                      │    │
+   │   proj-alpha     stack      choose "and stacks, keep volumes"            │    │
+   │                                                                          │    │
+   │ Ignored files, such as .env and node_modules, are deleted too.           │    │
+   │                                                                          │    │
+   │                           ▸ backspace cancel      y  delete 2 worktrees  │    │
+   └──────────────────────────────────────────────────────────────────────────┘    │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+
+  enter open   s stop   d delete   space mark   c cleanup   / search   a actions

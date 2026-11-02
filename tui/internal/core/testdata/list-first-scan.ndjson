@@ -1,0 +1,24 @@
+{"v":1,"event":"stage","stage":"structure"}
+{"v":1,"event":"repo","repo":{"common":"/fixture/home/code/proj/.git","name":"proj","main":"/fixture/home/code/proj","default_branch":"main"}}
+{"v":1,"event":"worktree","worktree":{"path":"/fixture/home/code/proj","common":"/fixture/home/code/proj/.git","repo":"proj","main":true,"branch":"main","detached":false,"head":"5acaca259fb1fc954337f59052cc45613d17743d","missing":false,"bare":false,"locked":null,"current":true,"odd":false}}
+{"v":1,"event":"worktree","worktree":{"path":"/fixture/home/code/worktrees/alpha","common":"/fixture/home/code/proj/.git","repo":"proj","main":false,"branch":"alpha","detached":false,"head":"5acaca259fb1fc954337f59052cc45613d17743d","missing":false,"bare":false,"locked":null,"current":false,"odd":false}}
+{"v":1,"event":"stack","stack":{"project":"p","dir":"/fixture/home/code/worktrees/alpha","dirs":["/fixture/home/code/worktrees/alpha"],"kind":"live","worktree":"/fixture/home/code/worktrees/alpha","common":"/fixture/home/code/proj/.git","worktrees":["/fixture/home/code/worktrees/alpha"],"states":{"running":1,"exited":1},"containers":[{"id":"id0","name":"p-app-id0","service":"app","state":"running","health":null,"status":"Up 1 hour","ports":"","published":[]},{"id":"id1","name":"p-app-id1","service":"app","state":"exited","health":null,"status":"Exited (0) 1 minute ago","ports":"","published":[]}],"volumes":1}}
+{"v":1,"event":"stage","stage":"structure","done":true,"ms":7}
+{"v":1,"event":"stage","stage":"git"}
+{"v":1,"event":"worktree_git","path":"/fixture/home/code/proj","missing":false,"changed":0,"untracked":0,"upstream":null,"upstream_gone":false,"ahead":null,"behind":null,"last_commit_at":1767323045,"last_commit_subject":"init","index_mtime":1767323045,"merged_into":null,"head_held":true,"unreadable":false,"timed_out":false}
+{"v":1,"event":"worktree_git","path":"/fixture/home/code/worktrees/alpha","missing":false,"changed":0,"untracked":0,"upstream":null,"upstream_gone":false,"ahead":null,"behind":null,"last_commit_at":1767323045,"last_commit_subject":"init","index_mtime":1767323045,"merged_into":"main","head_held":true,"unreadable":false,"timed_out":false}
+{"v":1,"event":"stage","stage":"git","done":true,"ms":7}
+{"v":1,"event":"stage","stage":"stats"}
+{"v":1,"event":"stack_stats","project":"p","cpu_pct":2.50,"mem_bytes":209715200,"containers":[{"id":"id0","cpu_pct":2.50,"mem_bytes":209715200}]}
+{"v":1,"event":"engine","ncpu":8,"mem_total":8589934592,"cpu_pct":2.50,"mem_bytes":209715200}
+{"v":1,"event":"stack_age","project":"p","last_started_at":1767225600,"last_finished_at":1767312000,"running":true,"stale":false}
+{"v":1,"event":"stage","stage":"stats","done":true,"ms":7}
+{"v":1,"event":"stage","stage":"disk"}
+{"v":1,"event":"disk_totals","images":null,"containers":null,"volumes":null,"build":null,"age_s":null,"refreshing":false}
+{"v":1,"event":"stage","stage":"disk","done":true,"ms":7}
+{"v":1,"event":"stage","stage":"cleanup"}
+{"v":1,"event":"cleanup","id":"worktree:/fixture/home/code/proj","kind":"worktree","label":"proj","tier":"never","reasons":[{"code":"main_checkout","text":"it is the main checkout"}],"bytes":null,"stacks":[]}
+{"v":1,"event":"cleanup","id":"worktree:/fixture/home/code/worktrees/alpha","kind":"worktree","label":"alpha","tier":"needs_look","reasons":[{"code":"merged_running","text":"merged into main, and a stack still runs"}],"bytes":null,"stacks":["p"]}
+{"v":1,"event":"cleanup_totals","safe":0,"needs_look":0,"never":0,"unknown":true}
+{"v":1,"event":"stage","stage":"cleanup","done":true,"ms":7}
+{"v":1,"event":"end","ms":7}

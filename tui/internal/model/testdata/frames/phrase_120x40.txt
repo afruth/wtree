@@ -1,0 +1,40 @@
+ wtree  ▌repo proj▐ machine   7 worktrees · 4 stacks · cleanup ~1K                          live now · disk 1m · ? help
+    NAME        BRANCH            GIT     STACK     CPU   MEM  DISK AGE            │ proj-gone
+  @ proj        main                                                1h             │ ~/nowhere
+  ▸ alpha                                 1/2      2.5%  200M  3.0G 1h             │ worktree gone 0/1
+  ▸ beta                          ±2      0/1                    1K 1h             │ 0 volumes
+    gamma       (detached) 13563a                                   1h             │
+    locked                        ⚿ ✓                               1h             │ cleanup: safe
+                                                                                   │ its worktree is gone
+  ! cleanup                                                                        │
+  ▸  proj-gone  worktree gone     exited  0/1                       4h             │ CONTAINERS
+     proj-vols  volumes only                                                       │ web  exited
+    merged      merged into main                                    1h             │
+   ┌─ delete stacks · 2 go · 2 stay ──────────────────────────────────────────┐    │
+   │ GOES                                                                     │    │
+   │   pa             stack · 1 volume  data lost                             │    │
+   │   pb             stack · 1 volume  data lost                             │    │
+   │                                                                          │    │
+   │ STAYS                                                                    │    │
+   │   aa             worktree   choose "and their worktrees"                 │    │
+   │   bb             worktree   choose "and their worktrees"                 │    │
+   │                                                                          │    │
+   │ deletes 2 stacks and 2 volumes · data lost                               │    │
+   │ Type "2 stacks" to delete                                                │    │
+   │ 2 stacks                                                                 │    │
+   │ >                                                                        │    │
+   │ enter confirms · empty backspace goes back                               │    │
+   └──────────────────────────────────────────────────────────────────────────┘    │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+
+  d delete   s stop   enter open   space mark   c cleanup   / search   a actions

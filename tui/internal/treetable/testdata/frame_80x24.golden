@@ -1,0 +1,24 @@
+ wtree  ▌repo foundry▐ machine     7 wt · 5 stacks · cleanup 5.6G  live 2s      
+    NAME           BRANCH            STACK         CPU   MEM   DISK             
+  @ feat-login ±   feat/login        1/3          4.1%  612M   1.2G             
+  ▾  feat-login-api                  partial 1/2  4.1%  612M   840M             
+       api                           running      3.9%  540M                    
+       db                            exited                                     
+     feat-login-e2e                  exited 0/1                380M             
+  ⌂ main                             1/1 up      12.0%  1.4G   3.1G             
+    fix-race ↑     (detached) 9ac1e2                                            
+  ▸ pricing-v2 ±   feat/pricing-v2   1/1 up       1.2%  220M   900M             
+    hotfix-1 ✓                                                                  
+                                                                                
+  ! cleanup                                                    5.6G             
+  ▸  old-spike     worktree gone     exited 0/2                5.2G             
+     foundry-demo  volumes only                                380M             
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ disk 18m ago · hidden: AGE                                                     
+ [enter open] [s stop] [d delete] [space mark] [a actions]                      

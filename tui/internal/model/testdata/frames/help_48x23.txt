@@ -1,0 +1,23 @@
+┌─ help · narrow 48x23 · unicode · dark ───────┐
+│ j k       move                               │
+│ enter     open or jump                       │
+│ a         actions of the row                 │
+│ space     mark                               │
+│ s         stop: nothing is running           │
+│ d         it is the main checkout            │
+│ /         search                             │
+│ c         cleanup view                       │
+│ g         repo or machine                    │
+│ q         quit                               │
+│ J K       move by a page                     │
+│ h l       collapse, expand                   │
+│ z         all open or closed                 │
+│ tab       mark                               │
+│ A         mark all that is shown             │
+│ u         unmark all                         │
+│ n         new worktree                       │
+│ o         cycle the order                    │
+│ ↓ more                                       │
+│                                              │
+│ u ascii glyphs  ·  t theme  ·  ? close       │
+└──────────────────────────────────────────────┘

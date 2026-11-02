@@ -1,0 +1,20 @@
+ wtree  ▌repo proj▐ machine   7 wt · cleanup ~1K
+    NAME        BRANCH    STACK         CPU   MEM   DISK
+  ▸ alpha                 1/2          2.5%  200M   3.0G
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ filter: alpha · backspace clear                    disk 1m
+  enter open   s stop   d delete   a actions

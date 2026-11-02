@@ -4,6 +4,36 @@ set -euo pipefail
 ADJECTIVES=(amber brisk calm crisp dusty eager fuzzy gentle golden hollow icy jolly keen lively mellow misty nimble oaken quiet rapid rosy rustic silver sleek stormy sunny swift tidal velvet witty)
 NOUNS=(anchor badger brook canyon cedar comet delta ember falcon fern glacier harbor heron island juniper lagoon lantern maple meadow otter pebble quartz raven reef ridge sparrow thicket tundra valley willow)
 
+# seconds for a docker read. docker stats needs about 2.4 s for 50 running containers, and if it runs
+# out of time the list only loses its CPU and memory
+DOCKER_READ_LIMIT=5
+DOCKER_STATS_LIMIT=6
+# a docker system df can need many minutes on a large engine
+DOCKER_DISK_LIMIT=600
+# seconds to look for other repos inside a worktree that has a large node_modules
+NESTED_SCAN_LIMIT=20
+# seconds for one git read that can hang on a dead mount, and for all the facts of one worktree in a list
+GIT_READ_LIMIT=20
+GIT_FACTS_LIMIT=10
+# seconds for a git read that looks only in the git directory, which a live repo answers at once
+GIT_QUICK_LIMIT=5
+# how many worktrees a list reads at once
+GIT_JOBS=8
+# seconds for a terminal adapter to open a tab
+OPEN_LIMIT=20
+# seconds that a first list waits for the scan of repos, which goes on behind it
+REPO_SCAN_WAIT=3
+# days after which a stopped stack counts as stale
+STALE_DAYS=7
+
+WTREE_VERSION=0.4.0
+# the number that docs/core-contract.md describes. It changes when a field goes or changes its type.
+CORE_CONTRACT=1
+
+# while a list loads, the rows on the screen can be gone, so the keys that act on rows wait for it.
+# ctrl-r and a tap on the header wait too, so that each reload has its own load event.
+GATED_KEYS=ctrl-a,tab,btab,enter,left-click,right-click,double-click,shift-left-click,shift-right-click,ctrl-d,ctrl-f,ctrl-s,ctrl-r,click-header
+
 die() {
   printf 'wtree: %s\n' "$*" >&2
   exit 1
@@ -11,24 +41,38 @@ die() {
 
 usage() {
   cat <<'EOF'
-usage: wtree       search the worktrees of this repo
-                enter: open, ctrl-d: delete, ctrl-f: force delete, ctrl-r: reload
+usage: wtree       show the worktrees and stacks of this repo. Outside a repo, of this machine
        wtree -n    create a worktree at the current HEAD in ../worktrees and open it
-       wtree -d    search the Docker Compose stacks of this repo and its worktrees, with usage
-                enter: open, ctrl-s: stop, ctrl-d: delete and keep volumes,
-                ctrl-f: delete with volumes, ctrl-r: reload
-       wtree -g    search all the worktrees on this machine, in any directory
-       wtree -g -d search all the Docker Compose stacks on this machine, in any directory
+       wtree -d    start on the Docker Compose stacks of this repo, with usage
+       wtree -g    show all the worktrees and stacks on this machine, in any directory
+       wtree -g -d start on all the Docker Compose stacks on this machine
 
-In a list, tab selects an entry and ctrl-a selects all the matches. A key then acts on all the
-selected entries, after one confirmation, and shows the progress.
-On screens narrower than 60 columns, enter or a tap opens a menu of these actions.
-Opening a worktree that is already open jumps to its tab.
-A deleted worktree offers to delete its stacks, and a deleted stack offers to delete its worktree.
-The ../worktrees directory is beside the main checkout. Needs git and fzf, and docker for -d.
+wtree uses the full-screen program wtree-tui when one that matches this script is beside the script
+or on PATH, and stdout is a terminal. Else it uses fzf. --tui, --fzf or WTREE_UI=tui|fzf choose one.
+Needs git, and fzf only without wtree-tui. Needs docker to show stacks.
+
+In wtree-tui all keys are plain, and ? shows the keys that apply now:
+  j k: move, enter: open, a: actions of the row, s: stop, d: delete and choose the level, n: new,
+  space: mark, A: mark all that is shown, u: unmark, /: search, c: cleanup, g: scope, q: quit
+A delete shows what goes and what stays. It asks again on a change, and it asks you to type a phrase
+before it takes the volumes of several stacks. A tap moves the cursor, and a tap on the cursor row
+opens its actions.
+
+With fzf, the keys of the worktree list are enter: open, ctrl-d: delete, ctrl-f: force delete,
+ctrl-r: reload. In the list of stacks they are enter: open, ctrl-s: stop, ctrl-d: delete and keep
+volumes, ctrl-f: delete with volumes, ctrl-r: reload. Tab selects an entry and ctrl-a selects all the
+matches. A key then acts on all the selected entries, after one confirmation, and shows the progress.
+The keys act only when the list has loaded. On screens narrower than 60 columns, enter or a tap
+opens a menu of these actions.
+
+wtree keeps a locked worktree, also on a force delete. Opening a worktree that is already open jumps
+to its tab. A deleted worktree offers to delete its stacks, and a deleted stack offers to delete its
+worktree. The ../worktrees directory is beside the main checkout.
 wtree -g looks for repos in $HOME, or in the directories of WTREE_ROOTS, separated by a colon.
 Opens or jumps to a tab in Rex, herdr, cmux, tmux, zellij, WezTerm, kitty, Ghostty, iTerm2, and Terminal.
 Other terminals get the path.
+
+wtree core is the JSON contract for other programs, see docs/core-contract.md.
 EOF
 }
 
@@ -36,13 +80,34 @@ main_worktree() {
   main_of .
 }
 
+# one field on each line. In a value, a newline is \001 and a tab is \002, so the odd path of a
+# worktree cannot pass for another path. Without -z (git before 2.36), a lock reason stays C-quoted,
+# and a newline in a path gives a line with no known field.
+worktree_porcelain() {
+  local status=0
+  limited "$GIT_QUICK_LIMIT" git -C "$1" worktree list --porcelain -z 2>/dev/null | tr '\n\t\0' '\001\002\n' || status=$?
+  if ((status == 0)); then return 0; fi
+  # a git that was killed for its time gets no second wait. A git before 2.36 refuses -z with status 129.
+  if ((status == 137 || status == 143)); then return "$status"; fi
+  limited "$GIT_QUICK_LIMIT" git -C "$1" worktree list --porcelain 2>/dev/null | tr '\t' '\002'
+}
+
+worktree_paths() {
+  worktree_porcelain "$1" | sed -n 's/^worktree //p'
+}
+
 # git -C accepts a checkout or a .git directory, and a worktree that is gone still has its repo
 main_of() {
-  { git -C "$1" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p'; } || true
+  { worktree_porcelain "$1" | sed -n '1s/^worktree //p' | tr '\001\002' '\n\t'; } || true
+}
+
+# git reports resolved paths, and a compose label can go through a symlink
+real_dir() {
+  if [[ -z $1 ]] || ! (cd "$1" 2>/dev/null && pwd -P); then printf '%s' "$1"; fi
 }
 
 common_of() {
-  git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+  limited "$GIT_QUICK_LIMIT" git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
 }
 
 is_global() {
@@ -72,17 +137,17 @@ is_narrow() {
 }
 
 require_fzf() {
-  command -v fzf >/dev/null 2>&1 || die "fzf is not on PATH"
+  command -v fzf >/dev/null 2>&1 || die "fzf is not on PATH. Install fzf 0.53 or later, or install wtree-tui, the full-screen program of the wtree release"
   local version major minor
   version=$(fzf --version)
   version=${version%% *}
   major=${version%%.*}
   minor=${version#*.}
   minor=${minor%%.*}
-  if ((major == 0 && minor < 53)); then die "wtree needs fzf 0.53 or later, this is fzf $version"; fi
+  if ((major == 0 && minor < 53)); then die "wtree needs fzf 0.53 or later, this is fzf $version. Install a newer fzf, or install wtree-tui, the full-screen program of the wtree release"; fi
 }
 
-# fzf exits 1 when enter finds no match, such as while the list still loads
+# fzf exits 1 when enter finds no match
 fzf_exit() {
   case $1 in
     1) return 0 ;;
@@ -98,13 +163,50 @@ menu() {
     --prompt="$title > " --bind='left-click:accept'
 }
 
-# a wedged Docker Desktop hangs every docker call, and the worktree list must still open
+# a new list clears the selection, but fzf 0.71 can keep it, so clear it at once on all versions.
+# The first list comes on stdin and not from a reload bound to start: before 0.54, fzf fires load
+# for an empty stdin too, and the keys would wake up before the rows arrive.
+# args: the title of the prompt, and the option of the list
+gated_reload() {
+  printf 'clear-selection+unbind(%s)+change-prompt(%s … > )+reload("$WTREE_SELF" %s)' "$GATED_KEYS" "$1" "$2"
+}
+
+# fzf draws a new list before it runs the load event. The prompt loses its dots last, so a key that
+# comes after that always counts. arg: the title of the prompt
+gated_load() {
+  printf 'clear-selection+rebind(%s)+change-prompt(%s > )' "$GATED_KEYS" "$1"
+}
+
+# The name of the repo is in the prompt, because Rex can open a float in the repo of another device.
+# It goes in an fzf action, so it keeps only plain characters.
+list_title() {
+  local name
+  if is_global; then
+    printf 'all %ss' "$1"
+    return 0
+  fi
+  name=$(basename "$(main_worktree)")
+  name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')
+  printf '%s %s' "${name:0:16}" "$1"
+}
+
+# args: seconds, then the command. A wedged Docker Desktop hangs every docker call, and a list must
+# still open. The status is above 128 when the time ran out.
 limited() {
+  local seconds=$1
+  shift
   "$@" &
   local job=$! watchdog status=0
+  # short sleeps, because a sleep for the whole limit stays behind after a fast command
   (
-    sleep 3
+    while ((seconds > 0)); do
+      sleep 1
+      kill -0 "$job" || exit 0
+      seconds=$((seconds - 1))
+    done
     kill "$job"
+    sleep 1
+    kill -9 "$job"
   ) >/dev/null 2>&1 &
   watchdog=$!
   { wait "$job"; } 2>/dev/null || status=$?
@@ -112,23 +214,44 @@ limited() {
   return "$status"
 }
 
+# arg: the status of a docker read
+docker_problem() {
+  if (($1 > 128)); then
+    printf 'Docker did not answer within %d seconds' "$DOCKER_READ_LIMIT"
+  else
+    printf 'Docker is not running'
+  fi
+}
+
+# prints the registered path of the deepest worktree that holds a directory. git keeps a registered path
+# as it was, and a parent of it can be a symlink by now, so both sides are compared resolved.
 worktree_of() {
-  local dir=$1 anchor=$2 best='' path
+  local dir=$1 anchor=$2 best='' best_len=0 path real
   [[ -n $dir ]] || return 0
-  while read -r path; do
-    if [[ ($dir == "$path" || $dir == "$path"/*) && ${#path} -gt ${#best} ]]; then best=$path; fi
-  done < <(git -C "$anchor" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+  dir=$(real_dir "$dir")
+  while IFS= read -r path; do
+    real=$(real_dir "$path")
+    if [[ ($dir == "$real" || $dir == "$real"/*) && ${#real} -gt $best_len ]]; then
+      best=$path
+      best_len=${#real}
+    fi
+  done < <(worktree_paths "$anchor")
   printf '%s' "$best"
 }
 
+# one project and one directory on each line, separated by a tab. The directory comes last, so a tab in
+# it stays in it. The status is the one of docker, so a caller can tell an engine that fails from no stacks.
 stack_pairs() {
-  { limited docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u; } || true
+  limited "$DOCKER_READ_LIMIT" docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u
 }
 
 stacks_in_worktree() {
-  local path=$1 common=$2 pairs=$3 project dir
-  printf '%s\n' "$pairs" | while IFS='|' read -r project dir; do
-    if [[ $dir == "$path" || $dir == "$path"/* ]] && [[ $(worktree_of "$dir" "$common") == "$path" ]]; then
+  local path=$1 common=$2 pairs=$3 project dir real
+  real=$(real_dir "$path")
+  printf '%s\n' "$pairs" | while IFS=$'\t' read -r project dir; do
+    [[ -n $dir ]] || continue
+    dir=$(real_dir "$dir")
+    if [[ $dir == "$real" || $dir == "$real"/* ]] && [[ $(worktree_of "$dir" "$common") == "$path" ]]; then
       printf '%s\n' "$project"
     fi
   done | sort -u
@@ -154,7 +277,10 @@ scan_repos() {
 
 # a submodule has its own .git entry, but it is not a worktree
 repo_of_dir() {
-  if [[ -z $(git -C "$1" rev-parse --show-superproject-working-tree 2>/dev/null) ]]; then common_of "$1" || true; fi
+  local super status=0
+  super=$(limited "$GIT_QUICK_LIMIT" git -C "$1" rev-parse --show-superproject-working-tree 2>/dev/null) || status=$?
+  if ((status > 128)); then return 0; fi
+  if [[ -z $super ]]; then common_of "$1" || true; fi
 }
 
 rescan_repos() {
@@ -200,30 +326,34 @@ worktree_stream() {
   local common
   while read -r common; do
     printf 'repo %s\n' "$common"
-    git -C "$common" worktree list --porcelain 2>/dev/null || true
+    worktree_porcelain "$common" || true
   done
 }
 
 list_worktrees() {
   local stacks
-  stacks=$(limited docker ps -a --filter label=com.docker.compose.project --format 'STACK\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}' 2>/dev/null) || stacks=
+  stacks=$(limited 3 docker ps -a --filter label=com.docker.compose.project --format 'STACK\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}' 2>/dev/null) || stacks=
   {
     if [[ -n $stacks ]]; then printf '%s\n' "$stacks"; fi
     list_repos "$(printf '%s\n' "$stacks" | cut -s -f3)" | worktree_stream
   } | awk -v home="$HOME" -v cols="$(term_cols)" -v global="${WTREE_GLOBAL:-}" '
     function basename_of(p) { sub(/\/$/, "", p); sub(/.*\//, "", p); return p }
     /^STACK\t/ { split($0, f, "\t"); s++; sp[s] = f[2]; sd[s] = f[3]; ss[s] = f[4]; next }
+    function plain(s) { gsub(/[[:cntrl:]]/, " ", s); return s }
+    BEGIN { for (i = 128; i < 256; i++) high[sprintf("%c", i)] = 1 }
     /^repo /     { repo = substr($0, 6); first = 1; next }
-    /^worktree / { path = substr($0, 10); ref = ""; gone = ""; bare = 0 }
+    /^worktree / { path = substr($0, 10); ref = ""; gone = ""; bare = 0; lock = ""; odd = path ~ /[\001\002]/ || repo ~ /\t/ }
+    !/^(HEAD |branch |detached|prunable|locked|bare|$)/ && !/^worktree / { odd = 1 }
     /^branch /   { ref = substr($0, 8); sub(/^refs\/heads\//, "", ref) }
     /^detached/  { ref = "(detached)" }
     /^prunable/  { gone = " [missing]" }
+    /^locked/    { lock = "[locked" (length($0) > 7 ? ": " plain(substr($0, 8)) : "") "]" }
     /^bare/      { bare = 1 }
     /^$/ {
       if (first) { reponame = basename_of(path); sub(/\.git$/, "", reponame) }
       main = first; first = 0
       if (bare && global != "") next
-      w++; wp[w] = path; wr[w] = ref; wg[w] = gone; wc[w] = repo; wn[w] = reponame; wm[w] = main
+      w++; wp[w] = path; wr[w] = ref; wg[w] = gone; wc[w] = repo; wn[w] = reponame; wm[w] = main; wl[w] = lock; wo[w] = odd
     }
     END {
       for (i = 1; i <= s; i++) {
@@ -238,20 +368,35 @@ list_worktrees() {
       }
       for (j = 1; j <= w; j++) {
         path = wp[j]
-        name = path; sub(/.*\//, "", name)
+        name = plain(path); sub(/.*\//, "", name)
+        # a row splits on tabs and lines, so the row has no path, and no key can act on it
+        if (wo[j]) {
+          printf "\t\t\033[1m%s\033[0m  \033[36m%s\033[0m\037  \033[33ma tab or newline in its path: wtree cannot act on it\033[0m\n", name, wr[j]
+          continue
+        }
         shown = path
         if (index(shown, home "/") == 1) shown = "~" substr(shown, length(home) + 1)
         docker = ""
         count = split(names[j], list, " ")
         for (i = 1; i <= count; i++) docker = docker (i > 1 ? ", " : "") sprintf("%s %d/%d up", list[i], up[j, list[i]], total[j, list[i]])
         owner = (global != "" && !wm[j]) ? "  \033[34m" wn[j] "\033[0m" : ""
+        room = cols < 60 ? cols - 2 : 50
+        if (length(wl[j]) > room) {
+          wl[j] = substr(wl[j], 1, room - 2)
+          # an awk that counts bytes can cut in the middle of a character, so drop what can be a part
+          for (i = 0; i < 4 && (substr(wl[j], length(wl[j])) in high); i++) wl[j] = substr(wl[j], 1, length(wl[j]) - 1)
+          wl[j] = wl[j] "…]"
+        }
+        badge = wl[j] == "" ? "" : "\033[35m" wl[j] "\033[0m"
         if (cols < 60) {
           if (length(shown) > cols - 6) shown = "…" substr(shown, length(shown) - cols + 8)
           printf "%s\t%s\t\033[1m%s\033[0m%s\037  \033[36m%s\033[0m\037  \033[2m%s%s\033[0m", path, wc[j], name, owner, wr[j], shown, wg[j]
+          if (badge != "") printf "\037  %s", badge
           if (docker != "") printf "\037  \033[33mdocker: %s\033[0m", docker
           printf "\n"
         } else {
           printf "%s\t%s\t\033[1m%s\033[0m%s", path, wc[j], name, owner
+          if (badge != "") printf "  %s", badge
           if (docker != "") printf "  \033[33mdocker: %s\033[0m", docker
           printf "\037  \033[36m%s\033[0m  \033[2m%s%s\033[0m\n", wr[j], shown, wg[j]
         }
@@ -610,22 +755,25 @@ open_tab() {
 }
 
 new_worktree() {
-  local base path name attempt=0
-  base="$(dirname "$(main_worktree)")/worktrees"
-  while :; do
-    name="${ADJECTIVES[RANDOM % ${#ADJECTIVES[@]}]}-${NOUNS[RANDOM % ${#NOUNS[@]}]}"
-    attempt=$((attempt + 1))
-    if ((attempt > 50)); then name="$name-$RANDOM"; fi
-    path="$base/$name"
-    if [[ ! -e $path ]] && ! git worktree list --porcelain | grep -Fxq "worktree $path"; then break; fi
-  done
-  mkdir -p "$base"
-  git worktree add --quiet --detach "$path" HEAD
-  printf '%s\n' "$path"
-  open_tab "$path"
+  pick_new_worktree "$(main_worktree)"
+  mkdir -p "$(dirname "$NEW_PATH")"
+  git worktree add --quiet --detach "$NEW_PATH" HEAD
+  printf '%s\n' "$NEW_PATH"
+  open_tab "$NEW_PATH"
+}
+
+# a key from before the prompt must not answer it: the prompt can come seconds after a key press.
+# This is stty, because bash 3.2 has no short read timeout. Empty min and time make cat stop at once.
+flush_input() {
+  local saved
+  saved=$({ stty -g </dev/tty; } 2>/dev/null) || return 0
+  stty -icanon min 0 time 0 </dev/tty 2>/dev/null || return 0
+  cat </dev/tty >/dev/null 2>&1 || true
+  stty "$saved" </dev/tty 2>/dev/null || true
 }
 
 pause() {
+  flush_input
   printf 'Press a key to continue. '
   read -r -n1 _ </dev/tty || true
 }
@@ -636,21 +784,23 @@ refuse() {
   return 0
 }
 
-read_key() {
+# sets KEY
+ask_key() {
+  flush_input
+  printf '%s' "$1"
   KEY=
   read -r -n1 KEY </dev/tty || KEY=
   printf '\n'
 }
 
 confirm() {
-  printf '%s [y/N] ' "$1"
-  read_key
+  ask_key "$1 [y/N] "
   [[ $KEY == y || $KEY == Y ]]
 }
 
 STEP_COUNT=0
 SHOW_OUTPUT=
-declare -a STEP_LABEL STEP_AFTER STEP_CMD STEP_RESULT
+declare -a STEP_LABEL STEP_AFTER STEP_CMD STEP_RESULT STEP_PLAN
 
 # after: the steps that must succeed first, separated by a space
 add_step() {
@@ -674,6 +824,17 @@ draw_progress() {
   if ((room < 8)); then room=8; fi
   if ((${#text} > room)); then text="${text:0:room-1}…"; fi
   printf '\r\033[K[%s] %s' "$bar" "$text"
+}
+
+# one process can run many actions from the phone menu, and each runs only its own steps
+clear_steps() {
+  STEP_COUNT=0
+  SHOW_OUTPUT=
+  STEP_LABEL=()
+  STEP_AFTER=()
+  STEP_CMD=()
+  STEP_RESULT=()
+  STEP_PLAN=()
 }
 
 # the output of a step goes to a file, so that it does not break the progress line
@@ -716,6 +877,7 @@ run_steps() {
     fi
   done
   rm -f "$log"
+  clear_steps
   draw_progress "$finished" "$total" "$((finished - failed - skipped)) of $total done" "$cols"
   if [[ -t 1 ]]; then printf '\n'; else printf '%d of %d done\n' "$((finished - failed - skipped))" "$total"; fi
   if ((failed > 0)); then
@@ -734,84 +896,979 @@ remove_worktree() {
   fi
 }
 
-# prints why a plain delete must not take this worktree
+# prints the line of git worktree list for a lock: "locked", or "locked" and the reason
+worktree_lock() {
+  worktree_porcelain "$2" | WANT="worktree $1" awk '
+    /^worktree / { found = ($0 == ENVIRON["WANT"]); next }
+    found && /^locked/ { print; exit }' | tr '\000-\011\013-\037\177' ' ' || true
+}
+
+# prints why no delete may take this worktree, and how to unlock it. A lock often marks a worktree on
+# a disk that is away, so a force delete keeps it too.
+lock_note() {
+  local path=$1 common=$2 lock reason
+  lock=$(worktree_lock "$path" "$common")
+  [[ -n $lock ]] || return 0
+  reason=${lock#locked}
+  reason=${reason# }
+  printf 'it is locked%s. To unlock it, run: git -C %q worktree unlock %q' "${reason:+ ($reason)}" "$(main_of "$common")" "$path"
+}
+
+# git worktree remove deletes the whole directory, also a worktree of the repo inside it. It does not
+# ask about the lock or the changes of that worktree. Prints the first one that exists.
+nested_worktree() {
+  local path=$1 common=$2 inner real
+  real=$(real_dir "$path")
+  while IFS= read -r inner; do
+    if [[ -e $inner && $(real_dir "$inner") == "$real"/* ]]; then
+      printf '%s' "$inner"
+      return 0
+    fi
+  done < <(worktree_paths "$common")
+}
+
+# prints the other git repos inside a worktree, also the ignored ones, which git status does not show,
+# and the bare ones, which have no .git entry. A submodule belongs to the worktree, so git refuses it or
+# a force delete takes it: its git directory is in this repo, and it can be fetched again. A repo with
+# its own git directory holds its own commits, also when the worktree tracks it as a gitlink.
+# args: the worktree, its repo. The status is above 128 when the time ran out.
+nested_repos() {
+  local path=$1 common entry dir found status=0 gitdir
+  common=$(real_dir "$2")
+  found=$(limited "$NESTED_SCAN_LIMIT" find "$path" -mindepth 2 \( -name .git -print -prune \) -o \( -type f -name HEAD -print \) 2>/dev/null) || status=$?
+  while IFS= read -r entry; do
+    [[ -n $entry ]] || continue
+    dir=${entry%/*}
+    if [[ ${entry##*/} == HEAD ]]; then
+      [[ -d $dir/objects && -d $dir/refs ]] || continue
+    elif [[ -f $entry && -n $common ]]; then
+      gitdir=$(limited "$GIT_QUICK_LIMIT" git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) || gitdir=''
+      if [[ -n $gitdir && $(real_dir "$gitdir") == "$common"/* ]]; then continue; fi
+    fi
+    printf '%s\n' "$dir"
+  done <<<"$found"
+  if ((status > 128)); then return "$status"; fi
+}
+
+# prints the directories of a project that are outside the paths. args: project, pairs, paths
+project_dirs_elsewhere() {
+  local project=$1 pairs=$2 name dir path inside
+  shift 2
+  local reals=()
+  for path in "$@"; do reals[${#reals[@]}]=$(real_dir "$path"); done
+  while IFS=$'\t' read -r name dir; do
+    [[ $name == "$project" ]] || continue
+    dir=$(real_dir "$dir")
+    inside=
+    for path in "${reals[@]}"; do
+      if [[ $dir == "$path" || $dir == "$path"/* ]]; then inside=1; fi
+    done
+    if [[ -z $inside ]]; then printf '%s\n' "$dir"; fi
+  done <<<"$pairs"
+}
+
+# ---- the safety policy. plan_* decide, the prompts and core apply only read what they decide, and each
+# step asks again when it runs. The fzf UI and the core contract have no other rules than these.
+
+plan_reset() {
+  PLAN_ACTION=$1
+  PLAN_FORCE=''
+  PLAN_VOLUMES=''
+  PLAN_REFUSAL=''
+  PLAN_DOCKER_NOTE=''
+  PLAN_NESTED_NAME=''
+  PLAN_FACTS=''
+  PLAN_ID=''
+  PLAN_PAIRS=''
+  PLAN_PAIRS_STATUS=0
+  PLAN_CWD=$(pwd -P 2>/dev/null) || PLAN_CWD=$PWD
+  PLAN_TOPLEVEL=$(limited "$GIT_QUICK_LIMIT" git rev-parse --show-toplevel 2>/dev/null) || PLAN_TOPLEVEL=
+  ITEM_ID=()
+  ITEM_KIND=()
+  ITEM_LABEL=()
+  ITEM_GO=()
+  ITEM_OFFERED=()
+  ITEM_CODE=()
+  ITEM_TEXT=()
+  ITEM_NOTE=()
+  ITEM_FORCE_OK=()
+  ITEM_PATH=()
+  ITEM_COMMON=()
+  ITEM_FACTS=()
+  ITEM_NESTED=()
+  ITEM_CODES=()
+  PW_ITEM=()
+  PST_NAME=()
+  PST_ITEM=()
+  PST_OWNER=()
+  PST_OWNERS=()
+  PST_ELSEWHERE=()
+  PST_PROTECTED=()
+  PST_VOLUMES=()
+  PST_VCOUNT=()
+  PST_DIRS=()
+  PS_KIND=()
+  PS_LABEL=()
+  PS_ITEM=()
+  PS_AFTER=()
+  PS_FORCE=()
+  PS_WITH_VOLUMES=()
+  PS_CHECK_OTHERS=()
+  WT_OWNERS=()
+  CHOICE_ID=()
+  CHOICE_TEXT=()
+  CHOICE_AVAILABLE=()
+  CHOICE_REASON=()
+  CHOICE_ADDS=()
+  CHOICE_STEPS=()
+  CHOICE_CONFIRM=()
+  CHOICE_PHRASES=()
+  CHOICE_VOLUMES=()
+}
+
+plan_fact() {
+  PLAN_FACTS+="$1"$'\n'
+}
+
+# args: id, kind, label, go, offered, code, text, note, force_ok, path, common. It sets ITEM_LAST.
+plan_item() {
+  ITEM_LAST=${#ITEM_ID[@]}
+  ITEM_ID[ITEM_LAST]=$1
+  ITEM_KIND[ITEM_LAST]=$2
+  ITEM_LABEL[ITEM_LAST]=$3
+  ITEM_GO[ITEM_LAST]=$4
+  ITEM_OFFERED[ITEM_LAST]=$5
+  ITEM_CODE[ITEM_LAST]=${6:-}
+  ITEM_TEXT[ITEM_LAST]=${7:-}
+  ITEM_NOTE[ITEM_LAST]=${8:-}
+  ITEM_FORCE_OK[ITEM_LAST]=${9:-}
+  ITEM_PATH[ITEM_LAST]=${10:-}
+  ITEM_COMMON[ITEM_LAST]=${11:-}
+  ITEM_FACTS[ITEM_LAST]=''
+  ITEM_NESTED[ITEM_LAST]=''
+  ITEM_CODES[ITEM_LAST]=''
+}
+
+# args: kind, label, item, after, force, with_volumes, check_others. It sets STEP_LAST.
+plan_step() {
+  STEP_LAST=${#PS_KIND[@]}
+  PS_KIND[STEP_LAST]=$1
+  PS_LABEL[STEP_LAST]=$2
+  PS_ITEM[STEP_LAST]=$3
+  PS_AFTER[STEP_LAST]=${4:-}
+  PS_FORCE[STEP_LAST]=${5:-}
+  PS_WITH_VOLUMES[STEP_LAST]=${6:-}
+  PS_CHECK_OTHERS[STEP_LAST]=${7:-}
+}
+
+# args: id, text, available, reason, adds, steps, confirm, phrases (separated by \037), volumes
+plan_choice() {
+  local c=${#CHOICE_ID[@]}
+  CHOICE_ID[c]=$1
+  CHOICE_TEXT[c]=$2
+  CHOICE_AVAILABLE[c]=$3
+  CHOICE_REASON[c]=$4
+  CHOICE_ADDS[c]=$5
+  CHOICE_STEPS[c]=$6
+  CHOICE_CONFIRM[c]=$7
+  CHOICE_PHRASES[c]=$8
+  CHOICE_VOLUMES[c]=${9:-}
+}
+
+plan_choice_index() {
+  local c
+  for ((c = 0; c < ${#CHOICE_ID[@]}; c++)); do
+    if [[ ${CHOICE_ID[c]} == "$1" ]]; then
+      printf '%d' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The answer of the human or of core apply. Nothing but the exact phrases of this choice opens it, in
+# the same order. Args: the index of the choice, then the typed phrases.
+plan_authorize() {
+  local c=$1 want phrase
+  shift
+  want=${CHOICE_PHRASES[c]}
+  while [[ -n $want ]]; do
+    phrase=${want%%$'\037'*}
+    if [[ $want == *$'\037'* ]]; then want=${want#*$'\037'}; else want=''; fi
+    (($# > 0)) || return 1
+    [[ $1 == "$phrase" ]] || return 1
+    shift
+  done
+  (($# == 0))
+}
+
+# prints a hash of stdin. It tells states apart and it is no security token, so any hash of the host will do.
+text_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256
+  elif command -v cksum >/dev/null 2>&1; then
+    { cksum | tr -d '\n' | tr ' ' '0'; printf '0000000000000000\n'; }
+  else
+    die "no sha256sum, shasum or cksum on this host"
+  fi
+}
+
+# prints the lines of one value on one line, so that sorting the facts cannot mix two values
+one_line() {
+  printf '%s' "$1" | tr '\n' '\037'
+}
+
+# what the plan does with those facts: what goes and what stays, the steps, and what each choice asks.
+# A rule can read more than its facts, so this is what makes a plan that would differ a stale plan.
+plan_outcome() {
+  local i s c
+  for ((i = 0; i < ${#ITEM_ID[@]}; i++)); do
+    printf 'item|%s|%s|%s|%s|%s|%s|%s|%s\n' "${ITEM_ID[i]}" "${ITEM_GO[i]}" "${ITEM_OFFERED[i]}" "${ITEM_CODE[i]}" "${ITEM_TEXT[i]}" "${ITEM_FORCE_OK[i]}" "${ITEM_NOTE[i]}" "${ITEM_CODES[i]}"
+  done
+  for ((s = 0; s < ${#PS_KIND[@]}; s++)); do
+    printf 'step|%d|%s|%s|%s|%s|%s\n' "$s" "${PS_KIND[s]}" "${ITEM_ID[PS_ITEM[s]]}" "${PS_AFTER[s]}" "${PS_FORCE[s]}" "${PS_WITH_VOLUMES[s]}"
+  done
+  for ((c = 0; c < ${#CHOICE_ID[@]}; c++)); do
+    printf 'choice|%s|%s|%s|%s|%s|%s\n' "${CHOICE_ID[c]}" "${CHOICE_AVAILABLE[c]}" "${CHOICE_ADDS[c]}" "${CHOICE_STEPS[c]}" "${CHOICE_CONFIRM[c]}" "${CHOICE_PHRASES[c]}"
+  done
+}
+
+# The plan_id is a staleness detector and not a security token.
+plan_fingerprint() {
+  local hash
+  hash=$(
+    {
+      printf 'action=%s\nforce=%s\nvolumes=%s\ncwd=%s\ntoplevel=%s\n' "$PLAN_ACTION" "$PLAN_FORCE" "$PLAN_VOLUMES" "$PLAN_CWD" "$PLAN_TOPLEVEL"
+      printf '%s' "$PLAN_FACTS" | LC_ALL=C sort
+      plan_outcome
+    } | text_hash
+  )
+  PLAN_ID=${hash:0:16}
+}
+
+# a tab or a newline splits a row, and a byte that is not UTF-8 cannot come back from JSON as itself.
+# Without C, one character is not one byte in json_set.
+path_is_odd() {
+  [[ -z $1 || $1 == *[$'\n\t']* ]] && return 0
+  (
+    export LC_ALL=C
+    json_set "$1"
+    [[ -n $J_LOSSY ]]
+  )
+}
+
+ODD_PATH_TEXT='a worktree with a tab, a newline, or bytes that are not UTF-8 in its path: wtree cannot act on it'
+
+# The one place that decides whether a delete may take a worktree. A plan and each delete step call it,
+# and a step runs only if the answer is still the one in the plan. Sets:
+#   WG_CODE, WG_TEXT           no delete may take it
+#   WG_RISK_CODES, WG_RISK     only a force delete may take it
+#   WG_NESTED                  a force delete also takes another repo, so its name must be typed
+#   WG_MISSING                 its directory is gone, and only the entry of git remains
+#   WG_FACTS                   all of this on one line, with what the changes and the repos are, for the plan_id
+worktree_guard() {
+  local path=$1 common=$2 main='' listed inner lock head='' status=0 repos='' repos_hash='' risk_add real more
+  WG_CODE=''
+  WG_TEXT=''
+  WG_RISK=''
+  WG_RISK_CODES=''
+  WG_NESTED=''
+  WG_MISSING=''
+  WR_STATE=''
+  real=$(real_dir "$path")
+  if [[ -n $common ]]; then main=$(main_of "$common"); fi
+  if path_is_odd "$path"; then
+    WG_CODE=odd_path
+    WG_TEXT=$ODD_PATH_TEXT
+  elif [[ -n $main && ($path == "$main" || $real == "$(real_dir "$main")") ]]; then
+    WG_CODE=main_checkout
+    WG_TEXT='it is the main checkout'
+  elif [[ $real == "$PLAN_TOPLEVEL" || $PLAN_TOPLEVEL == "$real"/* || $PLAN_CWD == "$real" || $PLAN_CWD == "$real"/* ]]; then
+    WG_CODE=current
+    WG_TEXT='you are in this worktree, run wtree from a different one'
+  else
+    listed=''
+    if [[ -n $common ]]; then listed=$(worktree_paths "$common"); fi
+    if ! grep -Fxq -- "$path" <<<"$listed"; then
+      WG_CODE=not_registered
+      WG_TEXT='git does not list it as a worktree of this repo'
+    fi
+  fi
+  if [[ -z $WG_CODE ]]; then
+    lock=$(lock_note "$path" "$common")
+    if [[ -n $lock ]]; then
+      WG_CODE=locked
+      WG_TEXT=$lock
+    else
+      inner=$(nested_worktree "$path" "$common")
+      if [[ -n $inner ]]; then
+        WG_CODE=nested_worktree
+        WG_TEXT="the worktree $(short_path "$inner") is inside it, delete that one first"
+      fi
+    fi
+  fi
+  if [[ -z $WG_CODE ]]; then
+    if [[ -d $path ]]; then
+      worktree_risk "$path" "$common"
+      head=$WR_HEAD
+      risk_add=''
+      repos=$(nested_repos "$path" "$common" | LC_ALL=C sort) || status=$?
+      if ((status != 0)); then
+        risk_add="wtree could not look through it within $NESTED_SCAN_LIMIT seconds"
+        WG_RISK_CODES+="${WG_RISK_CODES:+ }scan_timeout"
+      elif [[ -n $repos ]]; then
+        more=$(($(grep -c . <<<"$repos") - 1))
+        risk_add="another git repo is inside it: $(short_path "${repos%%$'\n'*}")"
+        if ((more > 0)); then risk_add+=" and $more more"; fi
+        repos_hash=$(printf '%s' "$repos" | text_hash)
+        WG_RISK_CODES+="${WG_RISK_CODES:+ }nested_repo"
+      fi
+      if [[ -n $risk_add ]]; then
+        WG_NESTED=1
+        WG_RISK+="${WG_RISK:+, }$risk_add"
+      fi
+    else
+      WG_MISSING=1
+      worktree_entry_risk "$path" "$common"
+      head=$WR_HEAD
+    fi
+  fi
+  WG_FACTS="worktree|$path|$common|$WG_CODE|$WG_TEXT|$WG_RISK_CODES|$WG_RISK|$WG_MISSING|$head|$WR_STATE|$repos_hash"
+}
+
+# args: the worktree, the seconds. git status looks away from what a config or a flag hides, so name what
+# it must show. git worktree remove trusts the same status.
+worktree_status() {
+  limited "$2" git --no-optional-locks -C "$1" status --porcelain --untracked-files=normal --ignore-submodules=none 2>/dev/null
+}
+
+# args: the worktree, the seconds. Prints the tracked files with an assume-unchanged or a skip-worktree
+# flag that are on the disk: git status does not check them, so they can hold edits. A sparse checkout has
+# many flags, for files that are not on the disk and hold nothing.
+worktree_hidden_files() {
+  local flagged line file
+  flagged=$(limited "$2" git -C "$1" ls-files -v -z 2>/dev/null | tr '\n\0' '\001\n' | LC_ALL=C awk '/^([a-z]|S) /') || return
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    file=${line:2}
+    file=${file//$'\001'/$'\n'}
+    if [[ -e $1/$file || -L $1/$file ]]; then printf '%s\n' "${line:2}"; fi
+  done <<<"$flagged"
+}
+
+# args: the repo, the commit. A stash or a note does not hold a commit that a person can find again.
+commit_is_held() {
+  [[ -n $(limited "$GIT_READ_LIMIT" git -C "$1" for-each-ref --count=1 --contains "$2" refs/heads refs/tags refs/remotes 2>/dev/null) ]]
+}
+
+# sets WR_HEAD and WR_STATE, and adds why a plain delete must not take this worktree to WG_RISK and
+# WG_RISK_CODES. A read that fails counts as a risk: wtree does not know that this worktree holds nothing.
 worktree_risk() {
-  local path=$1 common=$2 head
-  if [[ -n $(git -C "$path" status --porcelain 2>/dev/null) ]]; then
-    printf 'it has changed files'
+  local path=$1 common=$2 top status=0 changes='' hidden='' diff_hash
+  WR_HEAD=''
+  top=$(limited "$GIT_QUICK_LIMIT" git -C "$path" rev-parse --show-toplevel 2>/dev/null) || status=$?
+  if ((status == 0)) && [[ $top == "$(real_dir "$path")" ]]; then
+    changes=$(worktree_status "$path" "$GIT_READ_LIMIT") || status=$?
+    if ((status == 0)); then hidden=$(worktree_hidden_files "$path" "$GIT_READ_LIMIT") || status=$?; fi
+  else
+    status=1
+  fi
+  if ((status != 0)); then
+    WG_RISK='git cannot read it'
+    WG_RISK_CODES=unreadable
     return 0
   fi
+  if [[ -n $changes ]]; then
+    WG_RISK='it has changed files'
+    WG_RISK_CODES=dirty
+  elif [[ -n $hidden ]]; then
+    WG_RISK="git status does not check its file ${hidden%%$'\n'*}, which can hold changes"
+    WG_RISK_CODES=dirty
+  fi
+  # a force plan names only that a worktree has changes, so the plan_id needs what the changes are
+  if [[ -n $changes$hidden ]]; then
+    diff_hash=$(limited "$GIT_READ_LIMIT" git --no-optional-locks -C "$path" diff --no-ext-diff --no-color HEAD 2>/dev/null | text_hash) || diff_hash=''
+    WR_STATE=$(printf '%s\n%s\n%s' "$changes" "$hidden" "$diff_hash" | text_hash)
+    WR_STATE=${WR_STATE:0:16}
+  fi
+  WR_HEAD=$(limited "$GIT_READ_LIMIT" git -C "$path" rev-parse HEAD 2>/dev/null) || WR_HEAD=
   # git worktree remove does not protect commits that only a detached HEAD holds
-  if ! git -C "$path" symbolic-ref -q HEAD >/dev/null 2>&1; then
-    head=$(git -C "$path" rev-parse HEAD 2>/dev/null) || {
-      printf 'git cannot read it'
-      return 0
-    }
-    if [[ -z $(git -C "$common" for-each-ref --contains "$head" --count=1) ]]; then
-      printf 'no branch or tag holds its commit %s' "${head:0:9}"
+  if ! limited "$GIT_QUICK_LIMIT" git -C "$path" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    if [[ -z $WR_HEAD ]]; then
+      if [[ -z $WG_RISK ]]; then
+        WG_RISK='git cannot read it'
+        WG_RISK_CODES=unreadable
+      fi
+    elif [[ -z $WG_RISK ]] && ! commit_is_held "$common" "$WR_HEAD"; then
+      WG_RISK="no branch or tag holds its commit ${WR_HEAD:0:9}"
+      WG_RISK_CODES=unheld_commit
     fi
   fi
 }
 
+# the same for a worktree whose directory is gone. Only the entry of git is left, and it still holds a
+# detached HEAD, so taking the entry can lose the commit. Sets WR_HEAD.
+worktree_entry_risk() {
+  local path=$1 common=$2 entry
+  entry=$(worktree_porcelain "$common" | WANT="worktree $path" awk '
+    /^worktree / { found = ($0 == ENVIRON["WANT"]); next }
+    found && (/^HEAD / || /^detached/) { print }') || entry=''
+  WR_HEAD=$(sed -n 's/^HEAD //p' <<<"$entry")
+  [[ $entry == *detached* ]] || return 0
+  if [[ -z $WR_HEAD ]]; then
+    WG_RISK='git cannot read it'
+    WG_RISK_CODES=unreadable
+  elif ! commit_is_held "$common" "$WR_HEAD"; then
+    WG_RISK="no branch or tag holds its commit ${WR_HEAD:0:9}"
+    WG_RISK_CODES=unheld_commit
+  fi
+}
+
+# fills PST_* for one more stack of this plan. args: project, owner item, or -1
+plan_add_stack() {
+  local project=$1 owner=$2 k=${#PST_NAME[@]}
+  PST_NAME[k]=$project
+  PST_OWNER[k]=$owner
+  PST_OWNERS[k]=$owner
+  PST_ELSEWHERE[k]=''
+  PST_PROTECTED[k]=''
+  PST_VOLUMES[k]=''
+  PST_VCOUNT[k]=0
+  PST_DIRS[k]=$(stack_raw_dirs "$project" "$PLAN_PAIRS")
+  PST_ITEM[k]=-1
+}
+
+# args: the project, and the pairs. Prints its directories as docker labels them.
+stack_raw_dirs() {
+  local name dir
+  while IFS=$'\t' read -r name dir; do
+    if [[ $name == "$1" ]]; then printf '%s\n' "$dir"; fi
+  done <<<"$2" | LC_ALL=C sort -u
+}
+
+# reads the volumes of each stack of the plan. The status is the one of the first read that fails.
+plan_read_volumes() {
+  local k names status=0
+  for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+    names=$(stack_volumes "${PST_NAME[k]}" 2>/dev/null) || status=$?
+    if ((status != 0)); then return "$status"; fi
+    PST_VOLUMES[k]=$names
+    PST_VCOUNT[k]=$(grep -c . <<<"$names" || true)
+  done
+}
+
 # args: force, then the paths, then the repo of each path
-delete_worktrees() {
+plan_delete_worktrees() {
   local force=$1
   shift
-  local count=$(($# / 2)) i k n=0 skipped=0 path common main current risk pairs project stacks seen=' ' stack_mode=''
+  local count=$(($# / 2)) i k n path common stacks project seen=$'\n' seen_targets=$'\n' name volume_status=0 go_paths=() wt_steps='' keep_steps='' vol_steps='' adds='' phrases='' volume_phrases='' guarded=0 base j owner_steps owner
+  plan_reset delete-worktrees
+  PLAN_FORCE=$force
   ((count > 0)) || return 0
   local paths=("${@:1:count}") commons=("${@:count+1}")
-  local go_path=() go_common=() go_note=() skip_text=() stack_name=() stack_owner=() wt_step=()
-  current=$(git rev-parse --show-toplevel 2>/dev/null) || current=
   for ((i = 0; i < count; i++)); do
     path=${paths[i]}
     common=${commons[i]}
-    main=$(main_of "$common")
-    risk=
-    if [[ $path == "$main" ]]; then
-      skip_text[${#skip_text[@]}]="$(basename "$path"): it is the main checkout"
+    if [[ $seen_targets == *$'\n'"$path"$'\037'"$common"$'\n'* ]]; then continue; fi
+    seen_targets+="$path"$'\037'"$common"$'\n'
+    base=${path%/}
+    base=${base##*/}
+    if path_is_odd "$path"; then
+      plan_fact "worktree|odd|$path"
+      plan_item "worktree:$path" worktree "$base" '' '' odd_path "$ODD_PATH_TEXT" '' '' "$path" "$common"
       continue
-    elif [[ $path == "$current" ]]; then
-      skip_text[${#skip_text[@]}]="$(basename "$path"): you are in this worktree, run wtree from a different one"
-      continue
-    elif [[ -d $path ]]; then
-      risk=$(worktree_risk "$path" "$common")
-      if [[ -n $risk && -z $force ]]; then
-        skip_text[${#skip_text[@]}]="$(basename "$path"): $risk, press ctrl-f to delete it"
+    fi
+    worktree_guard "$path" "$common"
+    plan_fact "$WG_FACTS"
+    if [[ -n $WG_CODE ]]; then
+      plan_item "worktree:$path" worktree "$base" '' '' "$WG_CODE" "$WG_TEXT" '' '' "$path" "$common"
+    elif [[ -n $WG_RISK && -z $force ]]; then
+      plan_item "worktree:$path" worktree "$base" '' '' "${WG_RISK_CODES%% *}" "$WG_RISK" '' 1 "$path" "$common"
+      ITEM_CODES[ITEM_LAST]=$WG_RISK_CODES
+    else
+      if [[ -n $WG_MISSING ]]; then
+        plan_item "worktree:$path" worktree "$base" 1 '' '' '' "its directory is missing${WG_RISK:+, and $WG_RISK}" '' "$path" "$common"
+      else
+        plan_item "worktree:$path" worktree "$base" 1 '' '' '' "$WG_RISK" '' "$path" "$common"
+      fi
+      ITEM_FACTS[ITEM_LAST]=$WG_FACTS
+      ITEM_NESTED[ITEM_LAST]=$WG_NESTED
+      ITEM_CODES[ITEM_LAST]=$WG_RISK_CODES
+      if [[ -n $WG_NESTED ]]; then PLAN_NESTED_NAME+="${PLAN_NESTED_NAME:+$'\037'}$base"; fi
+      PW_ITEM[${#PW_ITEM[@]}]=$ITEM_LAST
+      go_paths[${#go_paths[@]}]=$path
+    fi
+  done
+  n=${#PW_ITEM[@]}
+  ((n > 0)) || return 0
+
+  PLAN_PAIRS=$(stack_pairs) || PLAN_PAIRS_STATUS=$?
+  plan_fact "docker|$PLAN_PAIRS_STATUS"
+  # 127: no docker on this host, so no stacks
+  if ((PLAN_PAIRS_STATUS != 0 && PLAN_PAIRS_STATUS != 127)); then
+    PLAN_DOCKER_NOTE="$(docker_problem "$PLAN_PAIRS_STATUS"), so wtree cannot see the stacks of these worktrees. A stack can keep running from a deleted worktree."
+  fi
+  for ((k = 0; k < n; k++)); do
+    i=${PW_ITEM[k]}
+    stacks=$(stacks_in_worktree "${ITEM_PATH[i]}" "${ITEM_COMMON[i]}" "$PLAN_PAIRS")
+    while IFS= read -r project; do
+      [[ -n $project ]] || continue
+      if [[ $seen == *$'\n'"$project"$'\n'* ]]; then
+        for ((j = 0; j < ${#PST_NAME[@]}; j++)); do
+          if [[ ${PST_NAME[j]} == "$project" ]]; then PST_OWNERS[j]+=" $i"; fi
+        done
         continue
       fi
-    else
-      risk='its directory is missing'
-    fi
-    k=${#go_path[@]}
-    go_path[k]=$path
-    go_common[k]=$common
-    go_note[k]=$risk
+      seen+="$project"$'\n'
+      plan_add_stack "$project" "$i"
+    done <<<"$stacks"
   done
-  n=${#go_path[@]}
-  if ((n > 0)); then pairs=$(stack_pairs); fi
-  for ((k = 0; k < n; k++)); do
-    stacks=$(stacks_in_worktree "${go_path[k]}" "${go_common[k]}" "$pairs")
-    for project in $stacks; do
-      if [[ $seen == *" $project "* ]]; then continue; fi
-      seen="$seen$project "
-      i=${#stack_name[@]}
-      stack_name[i]=$project
-      stack_owner[i]=$k
-    done
+  if ((${#PST_NAME[@]} > 0)); then plan_read_volumes || volume_status=$?; fi
+  plan_fact "volumes|$volume_status"
+  for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+    project=${PST_NAME[k]}
+    PST_ELSEWHERE[k]=$(project_dirs_elsewhere "$project" "$PLAN_PAIRS" "${go_paths[@]}")
+    if [[ -n ${PST_ELSEWHERE[k]} ]]; then guarded=$((guarded + 1)); fi
+    if project_is_protected "$project" "$PLAN_PAIRS"; then
+      PST_PROTECTED[k]=1
+      guarded=$((guarded + 1))
+    fi
+    plan_fact "stack|$project|$(one_line "${PST_DIRS[k]}")|${PST_PROTECTED[k]}|$(printf '%s' "${PST_VOLUMES[k]}" | LC_ALL=C sort | tr '\n' ' ')"
+    plan_item "stack:$project" stack "$project" 1 1
+    PST_ITEM[k]=$ITEM_LAST
+    adds+="${adds:+ }$ITEM_LAST"
   done
 
-  if ((${#skip_text[@]} > 0)); then
-    printf 'These stay:\n'
-    for ((i = 0; i < ${#skip_text[@]}; i++)); do printf '  %s\n' "${skip_text[i]}"; done
+  for ((k = 0; k < n; k++)); do
+    i=${PW_ITEM[k]}
+    # git worktree remove takes one entry, also when its directory is gone. A prune takes them all.
+    if [[ -d ${ITEM_PATH[i]} ]]; then
+      plan_step delete_worktree "delete worktree ${ITEM_LABEL[i]}" "$i" '' "$force" '' new
+    else
+      plan_step remove_missing "remove missing worktree ${ITEM_LABEL[i]}" "$i" '' '' '' new
+    fi
+    wt_steps+="${wt_steps:+ }$STEP_LAST"
+  done
+  for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+    # it waits for each selected worktree that it runs from: the steps of the worktrees come first, in
+    # the order of PW_ITEM, so they have the same numbers
+    owner_steps=''
+    for owner in ${PST_OWNERS[k]}; do
+      for ((j = 0; j < n; j++)); do
+        if ((PW_ITEM[j] == owner)); then owner_steps+="${owner_steps:+ }$j"; fi
+      done
+    done
+    plan_step stack_down "delete stack ${PST_NAME[k]}" "${PST_ITEM[k]}" "$owner_steps"
+    keep_steps+=" $STEP_LAST"
+    plan_step stack_down "delete stack ${PST_NAME[k]}" "${PST_ITEM[k]}" "$owner_steps" '' 1
+    vol_steps+=" $STEP_LAST"
+  done
+
+  if [[ -n $PLAN_NESTED_NAME ]]; then phrases=$PLAN_NESTED_NAME; fi
+  plan_choice worktrees 'worktrees only' 1 '' '' "$wt_steps" "$([[ -n $phrases ]] && echo phrase || echo key)" "$phrases"
+  if ((${#PST_NAME[@]} > 0)); then
+    plan_choice 'worktrees+stacks' 'and stacks, keep volumes' 1 '' "$adds" "$wt_steps$keep_steps" "$([[ -n $phrases ]] && echo phrase || echo key)" "$phrases"
+    volume_phrases=$phrases
+    if volumes_need_phrase "${#PST_NAME[@]}" "$guarded"; then
+      if ((${#PST_NAME[@]} > 1)); then name=$(plural "${#PST_NAME[@]}" 'stack'); else name=${PST_NAME[0]}; fi
+      volume_phrases+="${volume_phrases:+$'\037'}$name"
+    fi
+    if ((volume_status != 0)); then
+      plan_choice 'worktrees+stacks+volumes' 'and stacks with volumes' '' "$(docker_problem "$volume_status"), so nothing is deleted" "$adds" "$wt_steps$vol_steps" "$([[ -n $volume_phrases ]] && echo phrase || echo key)" "$volume_phrases" 1
+    else
+      plan_choice 'worktrees+stacks+volumes' 'and stacks with volumes' 1 '' "$adds" "$wt_steps$vol_steps" "$([[ -n $volume_phrases ]] && echo phrase || echo key)" "$volume_phrases" 1
+    fi
   fi
+}
+
+# args: with_volumes, use_labels, then the stacks, then the directory of each stack. With use_labels, the
+# directories come from docker, and they are all the directories of the project.
+plan_delete_stacks() {
+  local with_volumes=$1 use_labels=$2
+  shift 2
+  local count=$(($# / 2)) i k c n project dir wt common main risk seen=' ' found status=0 volume_status=0 other selected=$'\n' candidate_p=() candidate_d=() stack_steps='' wt_steps='' adds='' name protected=0 phrase='' after
+  plan_reset delete-stacks
+  PLAN_VOLUMES=$with_volumes
+  ((count > 0)) || return 0
+  local all_projects=("${@:1:count}") all_dirs=("${@:count+1}")
+  local wt_path=() wt_common=() wt_item=()
+  # a row can be old, and it shows one directory of a project, so ask docker
+  PLAN_PAIRS=$(stack_pairs) || PLAN_PAIRS_STATUS=$?
+  plan_fact "docker|$PLAN_PAIRS_STATUS"
+  for project in "${all_projects[@]}"; do
+    if [[ -n $project ]]; then selected+="$project"$'\n'; fi
+  done
+  seen=$'\n'
+  for ((i = 0; i < count; i++)); do
+    project=${all_projects[i]}
+    [[ -n $project ]] || continue
+    if [[ $seen == *$'\n'"$project"$'\n'* ]]; then continue; fi
+    seen+="$project"$'\n'
+    plan_add_stack "$project" -1
+    plan_item "stack:$project" stack "$project" 1 ''
+    PST_ITEM[${#PST_NAME[@]}-1]=$ITEM_LAST
+  done
+  n=${#PST_NAME[@]}
+  ((n > 0)) || return 0
+  if ((PLAN_PAIRS_STATUS != 0)); then
+    if [[ -n $with_volumes ]]; then
+      plan_refuse "$(docker_problem "$PLAN_PAIRS_STATUS"), so nothing is deleted"
+      return 0
+    fi
+    PLAN_DOCKER_NOTE="$(docker_problem "$PLAN_PAIRS_STATUS"), so all the worktrees stay."
+  fi
+  if [[ -n $with_volumes ]]; then
+    plan_read_volumes || volume_status=$?
+    if ((volume_status != 0)); then
+      plan_refuse "$(docker_problem "$volume_status"), so nothing is deleted"
+      return 0
+    fi
+  fi
+  for ((k = 0; k < n; k++)); do
+    project=${PST_NAME[k]}
+    if [[ -n $with_volumes ]] && project_is_protected "$project" "$PLAN_PAIRS"; then
+      PST_PROTECTED[k]=1
+      protected=$((protected + 1))
+    fi
+    plan_fact "stack|$project|$(one_line "${PST_DIRS[k]}")|${PST_PROTECTED[k]}|$(printf '%s' "${PST_VOLUMES[k]}" | LC_ALL=C sort | tr '\n' ' ')"
+  done
+
+  # the worktrees that these stacks can offer. A project in several directories can offer several.
+  if ((PLAN_PAIRS_STATUS == 0)); then
+    seen=$'\n'
+    for ((i = 0; i < count; i++)); do
+      project=${all_projects[i]}
+      [[ -n $project ]] || continue
+      if [[ $seen == *$'\n'"$project"$'\037'"${all_dirs[i]}"$'\n'* ]]; then continue; fi
+      seen+="$project"$'\037'"${all_dirs[i]}"$'\n'
+      if [[ -n $use_labels ]]; then
+        while IFS= read -r dir; do
+          candidate_p[${#candidate_p[@]}]=$project
+          candidate_d[${#candidate_d[@]}]=$dir
+        done <<<"$(stack_raw_dirs "$project" "$PLAN_PAIRS")"
+      else
+        candidate_p[${#candidate_p[@]}]=$project
+        candidate_d[${#candidate_d[@]}]=${all_dirs[i]}
+      fi
+    done
+  fi
+  seen=$'\n'
+  for ((c = 0; c < ${#candidate_p[@]}; c++)); do
+    project=${candidate_p[c]}
+    dir=${candidate_d[c]}
+    [[ -n $dir && -d $dir ]] || continue
+    grep -Fxq -- "$project"$'\t'"$dir" <<<"$PLAN_PAIRS" || continue
+    wt=$(worktree_of "$dir" "$dir")
+    [[ -n $wt ]] || continue
+    main=$(main_of "$dir")
+    [[ $wt != "$main" && $wt != "$PLAN_TOPLEVEL" ]] || continue
+    common=$(common_of "$dir") || continue
+    found=-1
+    for ((k = 0; k < ${#wt_path[@]}; k++)); do
+      if [[ ${wt_path[k]} == "$wt" ]]; then found=$k; fi
+    done
+    if ((found >= 0)); then
+      local j
+      for ((j = 0; j < n; j++)); do
+        if [[ ${PST_NAME[j]} == "$project" && " ${WT_OWNERS[found]} " != *" $j "* ]]; then WT_OWNERS[found]+=" $j"; fi
+      done
+      continue
+    fi
+    if [[ $seen == *$'\n'"$wt"$'\n'* ]]; then continue; fi
+    seen+="$wt"$'\n'
+    worktree_guard "$wt" "$common"
+    plan_fact "$WG_FACTS"
+    risk=$WG_TEXT
+    if [[ $WG_CODE == current ]]; then risk='you are inside it'; fi
+    if [[ -z $risk ]]; then risk=$WG_RISK; fi
+    local code=${WG_CODE:-${WG_RISK_CODES%% *}} in_worktree
+    in_worktree=$(stacks_in_worktree "$wt" "$common" "$PLAN_PAIRS")
+    if [[ -z $risk ]]; then
+      while IFS= read -r other; do
+        [[ -n $other ]] || continue
+        if [[ $selected != *$'\n'"$other"$'\n'* ]]; then
+          risk="the stack $other also has containers there, and it stays"
+          code=other_stack
+          break
+        fi
+      done <<<"$in_worktree"
+    fi
+    if [[ -n $risk ]]; then
+      plan_item "worktree:$wt" worktree "${wt##*/}" '' 1 "$code" "$risk" '' '' "$wt" "$common"
+      continue
+    fi
+    plan_item "worktree:$wt" worktree "${wt##*/}" 1 1 '' '' '' '' "$wt" "$common"
+    ITEM_FACTS[ITEM_LAST]=$WG_FACTS
+    k=${#wt_path[@]}
+    wt_path[k]=$wt
+    wt_common[k]=$common
+    wt_item[k]=$ITEM_LAST
+    WT_OWNERS[k]=''
+    # a row names one directory of a stack, and it waits for each selected stack that runs from here
+    for ((i = 0; i < n; i++)); do
+      if [[ ${PST_NAME[i]} == "$project" ]] || grep -Fxq -- "${PST_NAME[i]}" <<<"$in_worktree"; then WT_OWNERS[k]+=" $i"; fi
+    done
+  done
+  if ((protected > 0)); then
+    for ((k = 0; k < ${#wt_item[@]}; k++)); do
+      i=${wt_item[k]}
+      ITEM_GO[i]=''
+      ITEM_CODE[i]=protected_stack
+      ITEM_TEXT[i]='a stack of this plan has no linked worktree, so all the worktrees stay'
+    done
+    wt_path=()
+    wt_common=()
+    wt_item=()
+  fi
+
+  for ((k = 0; k < n; k++)); do
+    plan_step stack_down "delete stack ${PST_NAME[k]}" "${PST_ITEM[k]}" '' '' "$with_volumes"
+    stack_steps+="${stack_steps:+ }$STEP_LAST"
+  done
+  for ((k = 0; k < ${#wt_path[@]}; k++)); do
+    # the steps of its stacks have the same numbers as the stacks
+    after=${WT_OWNERS[k]}
+    plan_step delete_worktree "delete worktree ${wt_path[k]##*/}" "${wt_item[k]}" "$after" '' '' all
+    wt_steps+=" $STEP_LAST"
+    adds+="${adds:+ }${wt_item[k]}"
+  done
+
+  if [[ -n $with_volumes ]] && volumes_need_phrase "$n" "$protected"; then
+    if ((n > 1)); then phrase=$(plural "$n" 'stack'); else phrase=${PST_NAME[0]}; fi
+  fi
+  if [[ -n $phrase ]]; then
+    plan_choice stacks 'stacks only' 1 '' '' "$stack_steps" phrase "$phrase" "$with_volumes"
+    if ((${#wt_path[@]} > 0)); then plan_choice 'stacks+worktrees' 'and their worktrees' 1 '' "$adds" "$stack_steps$wt_steps" phrase "$phrase w" "$with_volumes"; fi
+  else
+    plan_choice stacks 'stacks only' 1 '' '' "$stack_steps" key '' "$with_volumes"
+    if ((${#wt_path[@]} > 0)); then plan_choice 'stacks+worktrees' 'and their worktrees' 1 '' "$adds" "$stack_steps$wt_steps" key '' "$with_volumes"; fi
+  fi
+}
+
+# args: the stacks
+plan_stop_stacks() {
+  local project seen=$'\n' steps=''
+  plan_reset stop-stacks
+  (($# > 0)) || return 0
+  PLAN_PAIRS=$(stack_pairs) || PLAN_PAIRS_STATUS=$?
+  plan_fact "docker|$PLAN_PAIRS_STATUS"
+  for project in "$@"; do
+    [[ -n $project ]] || continue
+    if [[ $seen == *$'\n'"$project"$'\n'* ]]; then continue; fi
+    seen+="$project"$'\n'
+    plan_add_stack "$project" -1
+    plan_item "stack:$project" stack "$project" 1 ''
+    plan_fact "stack|$project|$(one_line "${PST_DIRS[${#PST_DIRS[@]}-1]}")"
+    plan_step stack_stop "stop stack $project" "$ITEM_LAST"
+    steps+="${steps:+ }$STEP_LAST"
+  done
+  [[ -n $steps ]] || return 0
+  if ((${#PST_NAME[@]} > 1)); then
+    plan_choice stacks 'stop' 1 '' '' "$steps" key ''
+  else
+    plan_choice stacks 'stop' 1 '' '' "$steps" none ''
+  fi
+}
+
+# args: every (a missing directory gets a step that fails, and not a refusal), then the directories
+plan_open() {
+  local every=$1 dir steps='' n=0
+  shift
+  plan_reset open
+  for dir in "$@"; do
+    if [[ -z $every && ! -d $dir ]]; then
+      plan_item "dir:$dir" dir "${dir##*/}" '' '' no_directory 'the directory does not exist' '' '' "$dir"
+      plan_fact "dir|$dir|gone"
+      continue
+    fi
+    plan_item "dir:$dir" dir "${dir##*/}" 1 '' '' '' '' '' "$dir"
+    plan_fact "dir|$dir"
+    plan_step open "open ${dir##*/}" "$ITEM_LAST"
+    steps+="${steps:+ }$STEP_LAST"
+    n=$((n + 1))
+  done
+  ((n > 0)) || return 0
+  if ((n > 1)); then
+    plan_choice open 'open' 1 '' '' "$steps" key ''
+  else
+    plan_choice open 'open' 1 '' '' "$steps" none ''
+  fi
+}
+
+# nothing can run, and every item says why
+plan_refuse() {
+  local i
+  PLAN_REFUSAL=$1
+  for ((i = 0; i < ${#ITEM_ID[@]}; i++)); do
+    ITEM_GO[i]=''
+    ITEM_CODE[i]=docker_unavailable
+    ITEM_TEXT[i]=$1
+  done
+}
+
+# what one step does. It asks all its questions again first, because a plan is advice: the prompt can
+# wait for minutes, and an earlier step can take long.
+plan_step_exec() {
+  local s=$1 item=${PS_ITEM[$1]} k path common
+  case ${PS_KIND[s]} in
+    delete_worktree | remove_missing)
+      path=${ITEM_PATH[item]}
+      common=${ITEM_COMMON[item]}
+      worktree_guard "$path" "$common"
+      if [[ $WG_FACTS != "${ITEM_FACTS[item]}" ]]; then
+        printf 'It changed after the plan, so it stays: %s\n' "${WG_TEXT:-${WG_RISK:-its state is not the same}}"
+        return 1
+      fi
+      if [[ -n ${PS_CHECK_OTHERS[s]} ]]; then step_check_others "$path" "$common" "${PS_CHECK_OTHERS[s]}" || return 1; fi
+      remove_worktree "$path" "$common" "${PS_FORCE[s]}"
+      ;;
+    stack_down)
+      for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+        if ((PST_ITEM[k] == item)); then
+          step_check_stack "$k" "${PS_WITH_VOLUMES[s]}" || return 1
+          stack_down "${PST_NAME[k]}" "${PS_WITH_VOLUMES[s]}" "${PST_VOLUMES[k]}"
+          return
+        fi
+      done
+      printf 'wtree: no stack for this step\n'
+      return 1
+      ;;
+    stack_stop)
+      compose -p "${ITEM_LABEL[item]}" stop
+      ;;
+    open)
+      limited "$OPEN_LIMIT" open_tab "${ITEM_PATH[item]}"
+      ;;
+    *)
+      printf 'wtree: unknown step %s\n' "${PS_KIND[s]}"
+      return 1
+      ;;
+  esac
+}
+
+# a stack step runs only if docker still labels the same directories as in the plan, and its volumes go
+# only if the stack did not become protected: the prompt asked for less than a protected stack needs.
+# args: the stack, with_volumes
+step_check_stack() {
+  local k=$1 with_volumes=${2:-} pairs status=0 now
+  ((PLAN_PAIRS_STATUS == 0)) || return 0
+  pairs=$(stack_pairs) || status=$?
+  if ((status != 0)); then
+    printf '%s, so nothing is deleted\n' "$(docker_problem "$status")"
+    return 1
+  fi
+  now=$(stack_raw_dirs "${PST_NAME[k]}" "$pairs")
+  if [[ $now != "${PST_DIRS[k]}" ]]; then
+    printf 'The stack %s changed after the plan, so nothing is deleted. It runs in: %s\n' "${PST_NAME[k]}" "$(printf '%s ' $now)"
+    return 1
+  fi
+  if [[ -n $with_volumes && -z ${PST_PROTECTED[k]} ]] && step_stack_now_protected "$k" "$pairs"; then
+    printf 'The stack %s has no linked worktree now, so nothing is deleted\n' "${PST_NAME[k]}"
+    return 1
+  fi
+}
+
+# On the worktree side, the steps before this one took the selected worktrees, so only the directories
+# outside the selection can tell. args: the stack, the pairs
+step_stack_now_protected() {
+  local k=$1 dir
+  if [[ $PLAN_ACTION != delete-worktrees ]]; then
+    project_is_protected "${PST_NAME[k]}" "$2"
+    return
+  fi
+  while IFS= read -r dir; do
+    if [[ -n $dir ]] && stack_is_protected "$dir"; then return 0; fi
+  done <<<"${PST_ELSEWHERE[k]}"
+  return 1
+}
+
+# A worktree step asks docker again, because a stack that runs from a deleted directory breaks.
+# all, on the stack side: its stacks went in earlier steps, so any stack that is still there stays, also a
+# selected one whose down failed. new, on the worktree side: the plan named its stacks, and the human chose
+# what they do, so only a stack that the plan never showed stops it. args: path, repo, all or new
+step_check_others() {
+  local path=$1 common=$2 mode=$3 pairs status=0 other k known
+  if [[ $mode == new ]] && ((PLAN_PAIRS_STATUS != 0)); then return 0; fi
+  pairs=$(stack_pairs) || status=$?
+  if ((status != 0)); then
+    printf '%s, so the worktree stays\n' "$(docker_problem "$status")"
+    return 1
+  fi
+  while IFS= read -r other; do
+    [[ -n $other ]] || continue
+    known=''
+    if [[ $mode == new ]]; then
+      for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+        if [[ ${PST_NAME[k]} == "$other" ]]; then known=1; fi
+      done
+    fi
+    if [[ -z $known ]]; then
+      printf 'The stack %s has containers there now, so the worktree stays\n' "$other"
+      return 1
+    fi
+  done <<<"$(stacks_in_worktree "$path" "$common" "$pairs")"
+}
+
+# puts the steps of a choice into the queue of run_steps
+plan_queue() {
+  local c=$1 s d after position=0 map=()
+  for s in ${CHOICE_STEPS[c]}; do
+    after=''
+    for d in ${PS_AFTER[s]}; do
+      if [[ -n ${map[d]-} ]]; then after+="${after:+ }${map[d]}"; fi
+    done
+    add_step "$after" "${PS_LABEL[s]}" plan_step_exec "$s"
+    STEP_PLAN[position]=$s
+    map[s]=$position
+    position=$((position + 1))
+  done
+}
+
+plan_print_stays() {
+  local i shown='' extra
+  for ((i = 0; i < ${#ITEM_ID[@]}; i++)); do
+    [[ -z ${ITEM_GO[i]} ]] || continue
+    if [[ -z $shown ]]; then
+      printf 'These stay:\n'
+      shown=1
+    fi
+    extra=''
+    if [[ -n ${ITEM_FORCE_OK[i]} ]]; then extra=', press ctrl-f to delete it'; fi
+    if [[ ${ITEM_CODE[i]} == odd_path ]]; then
+      printf '  %s\n' "${ITEM_TEXT[i]}"
+    else
+      printf '  %s: %s%s\n' "${ITEM_LABEL[i]}" "${ITEM_TEXT[i]}" "$extra"
+    fi
+  done
+}
+
+# prints the stacks with the number of their volumes, and what is lost
+plan_print_volumes() {
+  local k total=0
+  for ((k = 0; k < ${#PST_NAME[@]}; k++)); do total=$((total + PST_VCOUNT[k])); done
+  printf 'Delete %s and %s:\n' "$(plural "${#PST_NAME[@]}" 'stack')" "$(plural "$total" 'volume')"
+  for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+    printf '  %s  (%s)\n' "${PST_NAME[k]}" "$(plural "${PST_VCOUNT[k]}" 'volume')"
+  done
+  printf 'The data in the volumes is lost.\n'
+}
+
+# sets CHOSEN to the choice and returns 0, or returns 1 if this ends here
+prompt_delete_worktrees() {
+  local force=$1 n=${#PW_ITEM[@]} i k project typed=() answer key_choice want phrase
+  CHOSEN=''
+  plan_print_stays
   if ((n == 0)); then
     refuse "nothing to delete"
-    return 0
+    return 1
   fi
   if [[ -n $force ]]; then printf 'FORCE delete %s:\n' "$(plural "$n" 'worktree')"; else printf 'Delete %s:\n' "$(plural "$n" 'worktree')"; fi
   for ((k = 0; k < n; k++)); do
-    printf '  %s' "$(short_path "${go_path[k]}")"
-    if [[ -n ${go_note[k]} ]]; then printf '  (%s)' "${go_note[k]}"; fi
+    i=${PW_ITEM[k]}
+    printf '  %s' "$(short_path "${ITEM_PATH[i]}")"
+    if [[ -n ${ITEM_NOTE[i]} ]]; then printf '  (%s)' "${ITEM_NOTE[i]}"; fi
     printf '\n'
   done
   if [[ -n $force ]]; then
@@ -819,38 +1876,79 @@ delete_worktrees() {
   else
     printf 'Ignored files, such as .env and node_modules, are deleted too.\n'
   fi
-  if ((${#stack_name[@]} == 0)); then
-    confirm 'Continue?' || return 0
+  if [[ -n $PLAN_DOCKER_NOTE ]]; then printf '%s\n' "$PLAN_DOCKER_NOTE"; fi
+  if [[ -n $PLAN_NESTED_NAME ]]; then
+    printf 'Another git repo inside a worktree is deleted too, with all its commits.\n'
+    want=$PLAN_NESTED_NAME
+    while [[ -n $want ]]; do
+      phrase=${want%%$'\037'*}
+      if [[ $want == *$'\037'* ]]; then want=${want#*$'\037'}; else want=''; fi
+      ask_phrase "$phrase"
+      [[ $ANSWER == "$phrase" ]] || return 1
+      typed[${#typed[@]}]=$ANSWER
+    done
+  fi
+  if ((${#PST_NAME[@]} == 0)); then
+    if [[ -z $PLAN_NESTED_NAME ]]; then confirm 'Continue?' || return 1; fi
+    CHOSEN=0
   else
     printf 'Docker stacks of these worktrees:\n'
-    for ((i = 0; i < ${#stack_name[@]}; i++)); do
-      printf '  %s  (%s)\n' "${stack_name[i]}" "$(basename "${go_path[stack_owner[i]]}")"
+    for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+      printf '  %s  (%s)\n' "${PST_NAME[k]}" "${ITEM_LABEL[PST_OWNER[k]]}"
+      if [[ -n ${PST_ELSEWHERE[k]} ]]; then
+        while IFS= read -r project; do
+          printf '    also runs in %s, and s or v takes its containers there too\n' "$(short_path "$project")"
+        done <<<"${PST_ELSEWHERE[k]}"
+      fi
     done
-    printf '[y: worktrees only, s: and stacks, keep volumes, v: and stacks with volumes, N: no] '
-    read_key
+    ask_key '[y: worktrees only, s: and stacks, keep volumes, v: and stacks with volumes, N: no] '
     case $KEY in
-      y | Y) ;;
-      s | S) stack_mode=keep ;;
-      v | V) stack_mode=volumes ;;
-      *) return 0 ;;
+      y | Y) CHOSEN=0 ;;
+      s | S) CHOSEN=1 ;;
+      v | V)
+        CHOSEN=2
+        if [[ -z ${CHOICE_AVAILABLE[2]} ]]; then
+          refuse "${CHOICE_REASON[2]}"
+          return 1
+        fi
+        plan_print_volumes
+        want=${CHOICE_PHRASES[2]}
+        phrase=${want##*$'\037'}
+        if [[ -n $want && $want != "$PLAN_NESTED_NAME" ]]; then
+          ask_phrase "$phrase"
+          typed[${#typed[@]}]=$ANSWER
+        else
+          confirm 'Continue?' || return 1
+        fi
+        ;;
+      *) return 1 ;;
     esac
   fi
+  plan_authorize "$CHOSEN" ${typed[@]+"${typed[@]}"}
+}
 
-  for ((k = 0; k < n; k++)); do
-    if [[ -d ${go_path[k]} ]]; then
-      add_step '' "delete worktree $(basename "${go_path[k]}")" remove_worktree "${go_path[k]}" "${go_common[k]}" "$force"
-    else
-      add_step '' "remove missing worktree $(basename "${go_path[k]}")" git -C "${go_common[k]}" worktree prune
-    fi
-    wt_step[k]=$((STEP_COUNT - 1))
-  done
-  if [[ -n $stack_mode ]]; then
-    for ((i = 0; i < ${#stack_name[@]}; i++)); do
-      add_step "${wt_step[stack_owner[i]]}" "delete stack ${stack_name[i]}" stack_down "${stack_name[i]}" "${stack_mode/keep/}"
-    done
+# args: the phrase, and a longer phrase that also takes the worktrees. Sets ANSWER.
+ask_phrase() {
+  local phrase=$1 offer=${2:-}
+  flush_input
+  if [[ -n $offer ]]; then
+    printf 'Type "%s" to delete, or "%s" to delete the worktrees too: ' "$phrase" "$offer"
+  else
+    printf 'Type "%s" to delete: ' "$phrase"
   fi
+  read -r ANSWER </dev/tty || ANSWER=
+}
+
+# args: force, then the paths, then the repo of each path
+delete_worktrees() {
+  local force=$1
+  shift
+  (($# > 0)) || return 0
+  plan_delete_worktrees "$force" "$@"
+  prompt_delete_worktrees "$force" || return 0
+  plan_queue "$CHOSEN"
   run_steps || true
-  if [[ -n $stack_mode ]]; then refresh_disk; fi
+  if ((CHOSEN > 0)); then refresh_disk; fi
 }
 
 open_many() {
@@ -889,8 +1987,9 @@ split_selection() {
 
 pick_worktree() {
   require_fzf
-  local selected count title action tap='' layout
+  local selected count title action tap='' layout list
   export WTREE_SELF=$0
+  list=$(list_title worktree)
   while :; do
     layout=(--height=80% --header=$'tab: select   ctrl-a: select all   enter: open   ctrl-d: delete   ctrl-f: force delete\nctrl-r: reload   esc: quit')
     if [[ -n $tap ]]; then
@@ -898,17 +1997,18 @@ pick_worktree() {
     elif is_narrow; then
       layout=(--height=100% --no-scrollbar --bind='left-click:accept' --header=$'enter: menu   tab: select   esc: quit\nctrl-d: delete   ctrl-f: force')
     fi
-    selected=$(: | SHELL=$(command -v bash) fzf \
+    selected=$(SHELL=$(command -v bash) fzf \
       --read0 --print0 --multi --ansi --highlight-line \
       --layout=reverse --info=inline \
-      --prompt="$(is_global && printf 'all worktrees' || printf 'worktree') > " \
+      --prompt="$list … > " \
       --delimiter=$'\t' --with-nth=3 \
       "${layout[@]}" \
-      --bind='start:reload("$WTREE_SELF" --list)' \
+      --bind="start:unbind($GATED_KEYS)" \
+      --bind="load:$(gated_load "$list")" \
       --bind='ctrl-a:toggle-all' \
-      --bind='ctrl-d:execute("$WTREE_SELF" --delete {+1} {+2})+reload("$WTREE_SELF" --list)' \
-      --bind='ctrl-f:execute("$WTREE_SELF" --force-delete {+1} {+2})+reload("$WTREE_SELF" --list)' \
-      --bind='ctrl-r:reload("$WTREE_SELF" --rescan)' | tr '\0' '\036') || {
+      --bind='ctrl-d:execute("$WTREE_SELF" --delete {+s1} {+s2})+'"$(gated_reload "$list" --list)" \
+      --bind='ctrl-f:execute("$WTREE_SELF" --force-delete {+s1} {+s2})+'"$(gated_reload "$list" --list)" \
+      --bind="ctrl-r:$(gated_reload "$list" --rescan)" < <("$WTREE_SELF" --list 2>/dev/null) | tr '\0' '\036') || {
       fzf_exit $?
       continue
     }
@@ -945,15 +2045,16 @@ cache_dir() {
 
 # docker system df needs a minute or more on a large engine, so it runs detached and fills a cache
 refresh_disk() {
-  local dir tmp
+  local dir tmp owner
   dir=$(cache_dir)
   mkdir -p "$dir"
   find "$dir/lock" -maxdepth 0 -mmin +15 -exec rmdir {} + 2>/dev/null || true
   mkdir "$dir/lock" 2>/dev/null || return 0
   tmp="$dir/tmp.$$"
   (
-    trap 'rm -f "$tmp"; rmdir "$dir/lock"' EXIT
-    docker system df -v --format '{{range .Volumes}}{{.Labels}}\t{{.Size}}\n{{end}}{{range .Containers}}{{.Labels}}\t{{.Size}}\n{{end}}' | awk -F'\t' '
+    owner=${BASHPID:-}
+    trap '[[ ${BASHPID:-} != "$owner" ]] || { rm -f "$tmp"; rmdir "$dir/lock"; }' EXIT
+    limited "$DOCKER_DISK_LIMIT" docker system df -v --format '{{range .Volumes}}{{.Labels}}\t{{.Size}}\n{{end}}{{range .Containers}}{{.Labels}}\t{{.Size}}\n{{end}}' | awk -F'\t' '
       function bytes(s, n, u) {
         n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
         return n * (u == "kB" ? 1e3 : u == "MB" ? 1e6 : u == "GB" ? 1e9 : u == "TB" ? 1e12 : 1)
@@ -963,7 +2064,7 @@ refresh_disk() {
       }
       END { for (p in total) printf "%s\t%.0f\n", p, total[p] }' >"$tmp"
     mv "$tmp" "$dir/disk-projects"
-    docker system df --format '{{.Type}}\t{{.Size}}' >"$tmp"
+    limited "$DOCKER_DISK_LIMIT" docker system df --format '{{.Type}}\t{{.Size}}' >"$tmp"
     mv "$tmp" "$dir/disk-totals"
   ) </dev/null >/dev/null 2>&1 &
 }
@@ -1002,21 +2103,52 @@ stack_kind() {
   esac
 }
 
+# args: seconds, file, then the docker arguments. With no file afterwards, the row shows that it does
+# not know a value, and not a zero.
+read_docker() {
+  local seconds=$1 file=$2
+  shift 2
+  limited "$seconds" docker "$@" >"$file" 2>/dev/null || rm -f "$file"
+}
+
 list_stacks() {
-  local common='' repo='' project dir kind ncpu memtotal age=-1 lower disk_projects=/dev/null disk_totals=/dev/null cache
+  local common='' repo='' project dir kind ncpu='' memtotal='' age=-1 lower disk_projects=/dev/null disk_totals=/dev/null cache status=0 stats_ok=1 volumes_ok=1
   WTREE_TMP=$(mktemp -d)
-  trap 'rm -rf "$WTREE_TMP"' EXIT
+  # a watchdog that is killed just after its fork still has this trap, and it must not take the files
+  WTREE_TMP_OWNER=${BASHPID:-}
+  trap '[[ ${BASHPID:-} != "$WTREE_TMP_OWNER" ]] || rm -rf "$WTREE_TMP"' EXIT
   if ! is_global; then
     common=$(common_of "$PWD")
     repo=$(basename "$(main_worktree)" | tr '[:upper:]' '[:lower:]')
   fi
   cache=$(cache_dir)
 
-  docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}\t{{.ID}}' >"$WTREE_TMP/ps"
-  docker stats --no-stream --format '{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}' >"$WTREE_TMP/stats"
-  docker volume ls --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}' >"$WTREE_TMP/volumes"
-  ncpu=$(docker info --format '{{.NCPU}}')
-  memtotal=$(docker info --format '{{.MemTotal}}')
+  limited "$DOCKER_READ_LIMIT" docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.State}}\t{{.ID}}' >"$WTREE_TMP/ps" 2>/dev/null || status=$?
+  # the two header rows of the list carry the message, because a reload has no other way to show one
+  if ((status != 0)); then
+    if is_narrow; then
+      printf '\t\t\033[33m%s\033[0m\0\t\t\033[2m%s\033[0m\0' "$( ((status > 128)) && printf 'Docker: no answer in %d s' "$DOCKER_READ_LIMIT" || docker_problem "$status")" 'Tap here to try again.'
+    else
+      printf '\t\t\033[33m%s\033[0m\0\t\t\033[2m%s\033[0m\0' "$(docker_problem "$status")" 'Press ctrl-r or click here to try again, or esc to quit.'
+    fi
+    return 1
+  fi
+  # the other reads run together, so that a wedged engine costs one limit and not one for each
+  read_docker "$DOCKER_STATS_LIMIT" "$WTREE_TMP/stats" stats --no-stream --format '{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}' &
+  read_docker "$DOCKER_READ_LIMIT" "$WTREE_TMP/volumes" volume ls --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}' &
+  read_docker "$DOCKER_READ_LIMIT" "$WTREE_TMP/ncpu" info --format '{{.NCPU}}' &
+  read_docker "$DOCKER_READ_LIMIT" "$WTREE_TMP/memtotal" info --format '{{.MemTotal}}' &
+  wait
+  [[ -f $WTREE_TMP/stats ]] || {
+    stats_ok=
+    : >"$WTREE_TMP/stats"
+  }
+  [[ -f $WTREE_TMP/volumes ]] || {
+    volumes_ok=
+    : >"$WTREE_TMP/volumes"
+  }
+  if [[ -f $WTREE_TMP/ncpu ]]; then ncpu=$(cat "$WTREE_TMP/ncpu"); fi
+  if [[ -f $WTREE_TMP/memtotal ]]; then memtotal=$(cat "$WTREE_TMP/memtotal"); fi
 
   list_repos "$(cut -f2 "$WTREE_TMP/ps")" | worktree_stream | awk '
     function basename_of(p) { sub(/\/$/, "", p); sub(/.*\//, "", p); return p }
@@ -1047,7 +2179,7 @@ list_stacks() {
     age=$((($(date +%s) - $(date -r "$disk_totals" +%s)) / 60))
   fi
 
-  awk -F'\t' -v global="${WTREE_GLOBAL:-}" -v home="$HOME" -v cols="$(term_cols)" -v ncpu="$ncpu" -v memtotal="$memtotal" -v age="$age" -v busy="$([[ -d $cache/lock ]] && echo 1 || echo 0)" \
+  awk -F'\t' -v global="${WTREE_GLOBAL:-}" -v home="$HOME" -v cols="$(term_cols)" -v ncpu="$ncpu" -v memtotal="$memtotal" -v age="$age" -v stats_ok="$stats_ok" -v volumes_ok="$volumes_ok" -v busy="$([[ -d $cache/lock ]] && echo 1 || echo 0)" \
     -v worktreesf="$WTREE_TMP/worktrees" -v statsf="$WTREE_TMP/stats" -v membersf="$WTREE_TMP/members" -v psf="$WTREE_TMP/ps" -v volumesf="$WTREE_TMP/volumes" -v diskf="$disk_projects" -v totalsf="$disk_totals" '
     function bytes(s, n, u) {
       n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
@@ -1075,7 +2207,9 @@ list_stacks() {
     FILENAME == totalsf { total[$1] = $2; next }
     END {
       narrow = cols < 60
-      line = sprintf(narrow ? "CPU %.0f%%/%d%%  mem %s/%s" : "Docker  CPU %.0f%% of %d%%   memory %s of %s", allcpu, ncpu * 100, mem_text(allmem), mem_text(memtotal))
+      if (!stats_ok) line = narrow ? "CPU, mem: no answer from Docker" : "Docker  CPU and memory: docker stats did not answer"
+      else if (ncpu == "" || memtotal == "") line = sprintf(narrow ? "CPU %.0f%%  mem %s" : "Docker  CPU %.0f%%   memory %s", allcpu, mem_text(allmem))
+      else line = sprintf(narrow ? "CPU %.0f%%/%d%%  mem %s/%s" : "Docker  CPU %.0f%% of %d%%   memory %s of %s", allcpu, ncpu * 100, mem_text(allmem), mem_text(memtotal))
       if (age < 0) d = narrow ? "disk: reading, ctrl-r later" : "disk: Docker is reading the sizes, press ctrl-r later"
       else if (narrow) d = sprintf("img %s ctr %s vol %s bld %s %dm%s", whole(total["Images"]), whole(total["Containers"]), whole(total["Local Volumes"]), whole(total["Build Cache"]), age, busy ? " upd" : "")
       else d = sprintf("disk: images %s, containers %s, volumes %s, build %s (%d min old%s)", total["Images"], total["Containers"], total["Local Volumes"], total["Build Cache"], age, busy ? ", update in progress" : "")
@@ -1095,10 +2229,12 @@ list_stacks() {
         on = branch == "" ? "" : "\033[35mon " (global != "" ? owner " " : "") branch "\033[0m"
         shown = dir[p]
         if (index(shown, home "/") == 1) shown = "~" substr(shown, length(home) + 1)
-        usage = (((p, "running") in n) ? sprintf("CPU %.1f%%  memory %s  ", pcpu[p], mem_text(pmem[p])) : "") "disk " ((p in disk) ? disk_text(disk[p]) : "?") "  volumes " (vols[p] + 0)
         rank = ((p, "running") in n) ? 1 : 2
+        live = rank == 1 && stats_ok
+        volcount = volumes_ok ? vols[p] + 0 : "?"
+        usage = (live ? sprintf("CPU %.1f%%  memory %s  ", pcpu[p], mem_text(pmem[p])) : "") "disk " ((p in disk) ? disk_text(disk[p]) : "?") "  volumes " volcount
         if (narrow) {
-          usage = ((rank == 1) ? sprintf("CPU %.1f%%  mem %s  ", pcpu[p], mem_text(pmem[p])) : "") "disk " ((p in disk) ? disk_text(disk[p]) : "?") "  vol " (vols[p] + 0)
+          usage = (live ? sprintf("CPU %.1f%%  mem %s  ", pcpu[p], mem_text(pmem[p])) : "") "disk " ((p in disk) ? disk_text(disk[p]) : "?") "  vol " volcount
           if (on != "") usage = on "\037  " usage
           if (length(shown) > cols - 6) shown = "…" substr(shown, length(shown) - cols + 8)
           printf "%d\t%s\t%s\t%s\t\033[1m%s\033[0m\037  \033[36m%s\033[0m%s\037  %s\037  \033[2m%s\033[0m\n", rank, p, p, dir[p], p, state, note, usage, shown
@@ -1119,149 +2255,153 @@ compose() {
   )
 }
 
-stack_down() {
-  local project=$1 with_volumes=${2:-} volume
-  compose -p "$project" down
-  if [[ -n $with_volumes ]]; then
-    for volume in $(docker volume ls -q --filter "label=com.docker.compose.project=$project"); do
-      docker volume rm "$volume"
-    done
-  fi
+# a read fails on its own status, so an engine that fails cannot pass for a stack with no volumes
+stack_volumes() {
+  limited "$DOCKER_READ_LIMIT" docker volume ls -q --filter "label=com.docker.compose.project=$1"
 }
 
-# a stack without a linked worktree can hold the only copy of its data
+# run_steps runs in an || list, where set -e does nothing, so each failure must return here.
+# down and rm change the engine and can take long, so they have no time limit. The volumes are read
+# first, because the engine is busiest after a down, and a stack with no containers leaves the list.
+# args: project, with_volumes, and the volumes that the plan showed
+stack_down() {
+  local project=$1 with_volumes=${2:-} planned=${3:-} volumes='' volume status=0
+  if [[ -n $with_volumes ]]; then
+    volumes=$(stack_volumes "$project") || status=$?
+    if ((status != 0)); then
+      printf '%s, so nothing is deleted\n' "$(docker_problem "$status")"
+      return 1
+    fi
+    if [[ $(printf '%s\n' "$volumes" | LC_ALL=C sort) != "$(printf '%s\n' "$planned" | LC_ALL=C sort)" ]]; then
+      printf 'The volumes of %s changed after the plan, so nothing is deleted\n' "$project"
+      return 1
+    fi
+  fi
+  compose -p "$project" down || return
+  for volume in $volumes; do
+    docker volume rm "$volume" || {
+      status=$?
+      printf 'The containers are gone, and these volumes can remain: %s\nwtree -g -d lists them.\n' "$(printf '%s ' $volumes)"
+      return "$status"
+    }
+  done
+}
+
+# a stack without a linked worktree can hold the only copy of its data. So can a stack with no known
+# directory: it was brought down, or its directory is gone, and wtree cannot tell where it was.
 stack_is_protected() {
   local dir=$1 main
-  [[ -n $dir && -d $dir ]] || return 1
+  [[ -n $dir ]] || return 0
+  dir=$(cd "$dir" 2>/dev/null && pwd -P) || return 0
   main=$(main_of "$dir")
+  main=$(real_dir "$main")
   [[ -z $main || $dir == "$main" || $dir == "$main"/* ]]
 }
 
+# args: the number of stacks, and how many of them are protected. Volume data does not come back, so a
+# stray key must not delete it from several stacks, from either list.
+volumes_need_phrase() {
+  (($1 > 1 || $2 > 0))
+}
+
+# a project can have containers in several directories, and one protected directory is enough.
+# A project with no containers has only its volumes left.
+project_is_protected() {
+  local project=$1 name dir found=
+  while IFS=$'\t' read -r name dir; do
+    [[ $name == "$project" ]] || continue
+    found=1
+    if stack_is_protected "$dir"; then return 0; fi
+  done <<<"$2"
+  [[ -z $found ]]
+}
+
 stop_stacks() {
-  local project
+  local project i
   (($# > 0)) || return 0
-  if (($# > 1)); then
-    printf 'Stop %s:\n' "$(plural "$#" 'stack')"
-    for project in "$@"; do printf '  %s\n' "$project"; done
+  plan_stop_stacks "$@"
+  ((${#CHOICE_ID[@]} > 0)) || return 0
+  if [[ ${CHOICE_CONFIRM[0]} == key ]]; then
+    printf 'Stop %s:\n' "$(plural "${#PST_NAME[@]}" 'stack')"
+    for project in "${PST_NAME[@]}"; do printf '  %s\n' "$project"; done
     confirm 'Continue?' || return 0
   fi
-  for project in "$@"; do add_step '' "stop stack $project" compose -p "$project" stop; done
+  plan_queue 0
   run_steps || true
+}
+
+# sets CHOSEN to the choice and returns 0, or returns 1 if this ends here
+prompt_delete_stacks() {
+  local with_volumes=$1 n=${#PST_NAME[@]} i k found='' offered=0 kept=0 phrase offer typed=() protected=()
+  CHOSEN=''
+  ((n > 0)) || return 1
+  if [[ -n $PLAN_REFUSAL ]]; then
+    refuse "$PLAN_REFUSAL"
+    return 1
+  fi
+  if [[ -n $PLAN_DOCKER_NOTE ]]; then printf '%s\n' "$PLAN_DOCKER_NOTE"; fi
+  if [[ -n $with_volumes ]]; then
+    plan_print_volumes
+  else
+    printf 'Delete the containers and networks of %s. The volumes stay:\n' "$(plural "$n" 'stack')"
+    for ((k = 0; k < n; k++)); do printf '  %s\n' "${PST_NAME[k]}"; done
+  fi
+  for ((k = 0; k < n; k++)); do
+    if [[ -n ${PST_PROTECTED[k]} ]]; then protected[${#protected[@]}]=${PST_NAME[k]}; fi
+  done
+  if ((${#protected[@]} > 0)); then
+    printf 'These stacks belong to a main checkout, to no repo, or to a directory that is gone:\n'
+    for ((i = 0; i < ${#protected[@]}; i++)); do printf '  %s\n' "${protected[i]}"; done
+    printf 'All the worktrees stay.\n'
+  else
+    for ((i = 0; i < ${#ITEM_ID[@]}; i++)); do
+      if [[ ${ITEM_KIND[i]} == worktree && -z ${ITEM_GO[i]} ]]; then
+        if ((kept == 0)); then printf 'These worktrees stay:\n'; fi
+        kept=$((kept + 1))
+        printf '  %s: %s\n' "${ITEM_LABEL[i]}" "${ITEM_TEXT[i]}"
+      fi
+    done
+  fi
+  for ((i = 0; i < ${#ITEM_ID[@]}; i++)); do
+    if [[ ${ITEM_KIND[i]} == worktree && -n ${ITEM_GO[i]} ]]; then offered=$((offered + 1)); fi
+  done
+  if ((offered > 0)); then
+    printf 'Worktrees of these stacks:\n'
+    for ((i = 0; i < ${#ITEM_ID[@]}; i++)); do
+      if [[ ${ITEM_KIND[i]} == worktree && -n ${ITEM_GO[i]} ]]; then printf '  %s\n' "$(short_path "${ITEM_PATH[i]}")"; fi
+    done
+    printf 'Deleting a worktree also deletes its ignored files, such as .env and node_modules.\n'
+  fi
+  if [[ ${CHOICE_CONFIRM[0]} == phrase ]]; then
+    phrase=${CHOICE_PHRASES[0]}
+    offer=''
+    if ((offered > 0)); then offer=${CHOICE_PHRASES[1]}; fi
+    ask_phrase "$phrase" "$offer"
+    CHOSEN=0
+    if [[ -n $offer && $ANSWER == "$offer" ]]; then CHOSEN=1; fi
+    typed[0]=$ANSWER
+  elif ((offered == 0)); then
+    confirm 'Continue?' || return 1
+    CHOSEN=0
+  else
+    ask_key '[y: stacks only, w: and worktrees, N: no] '
+    case $KEY in
+      y | Y) CHOSEN=0 ;;
+      w | W) CHOSEN=1 ;;
+      *) return 1 ;;
+    esac
+  fi
+  plan_authorize "$CHOSEN" ${typed[@]+"${typed[@]}"}
 }
 
 # args: with_volumes, then the stacks, then the directory of each stack
 delete_stacks() {
   local with_volumes=$1
   shift
-  local count=$(($# / 2)) i k n=0 project dir current wt common main risk seen=' ' volumes=0 found phrase with_worktrees='' answer after
-  ((count > 0)) || return 0
-  local all_projects=("${@:1:count}") all_dirs=("${@:count+1}")
-  local projects=() dirs=() counts=() protected=() wt_path=() wt_common=() wt_keep=() owner=()
-  current=$(git rev-parse --show-toplevel 2>/dev/null) || current=
-  for ((i = 0; i < count; i++)); do
-    if [[ -z ${all_projects[i]} ]]; then continue; fi
-    n=${#projects[@]}
-    projects[n]=${all_projects[i]}
-    dirs[n]=${all_dirs[i]}
-    owner[n]=-1
-    counts[n]=0
-    dir=${dirs[n]}
-    if [[ -n $with_volumes ]]; then
-      counts[n]=$(docker volume ls -q --filter "label=com.docker.compose.project=${projects[n]}" | wc -l | tr -d ' ')
-      volumes=$((volumes + counts[n]))
-      if stack_is_protected "$dir"; then protected[${#protected[@]}]=${projects[n]}; fi
-    fi
-    [[ -n $dir && -d $dir ]] || continue
-    wt=$(worktree_of "$dir" "$dir")
-    main=$(main_of "$dir")
-    [[ -n $wt && $wt != "$main" && $wt != "$current" ]] || continue
-    common=$(common_of "$dir") || continue
-    found=-1
-    for ((k = 0; k < ${#wt_path[@]}; k++)); do
-      if [[ ${wt_path[k]} == "$wt" ]]; then found=$k; fi
-    done
-    if ((found >= 0)); then
-      owner[n]=$found
-      continue
-    fi
-    risk=$(worktree_risk "$wt" "$common")
-    if [[ -n $risk ]]; then
-      if [[ $seen != *" $wt "* ]]; then
-        seen="$seen$wt "
-        wt_keep[${#wt_keep[@]}]="$(basename "$wt"): $risk"
-      fi
-      continue
-    fi
-    k=${#wt_path[@]}
-    wt_path[k]=$wt
-    wt_common[k]=$common
-    owner[n]=$k
-  done
-  n=${#projects[@]}
-  ((n > 0)) || return 0
-
-  if [[ -n $with_volumes ]]; then
-    printf 'Delete %s and %s:\n' "$(plural "$n" 'stack')" "$(plural "$volumes" 'volume')"
-    for ((i = 0; i < n; i++)); do printf '  %s  (%s)\n' "${projects[i]}" "$(plural "${counts[i]}" 'volume')"; done
-    printf 'The data in the volumes is lost.\n'
-  else
-    printf 'Delete the containers and networks of %s. The volumes stay:\n' "$(plural "$n" 'stack')"
-    for ((i = 0; i < n; i++)); do printf '  %s\n' "${projects[i]}"; done
-  fi
-
-  if ((${#protected[@]} > 0)); then
-    printf 'These stacks belong to a main checkout, or to no repo:\n'
-    for ((i = 0; i < ${#protected[@]}; i++)); do printf '  %s\n' "${protected[i]}"; done
-    printf 'All the worktrees stay.\n'
-    wt_path=()
-  elif ((${#wt_keep[@]} > 0)); then
-    printf 'These worktrees stay:\n'
-    for ((i = 0; i < ${#wt_keep[@]}; i++)); do printf '  %s\n' "${wt_keep[i]}"; done
-  fi
-  if ((${#wt_path[@]} > 0)); then
-    printf 'Worktrees of these stacks:\n'
-    for ((k = 0; k < ${#wt_path[@]}; k++)); do printf '  %s\n' "$(short_path "${wt_path[k]}")"; done
-    printf 'Deleting a worktree also deletes its ignored files, such as .env and node_modules.\n'
-  fi
-  # volume data does not come back, so a stray key must not delete it from several stacks
-  if [[ -n $with_volumes ]] && ((n > 1 || ${#protected[@]} > 0)); then
-    phrase=${projects[0]}
-    if ((n > 1)); then phrase=$(plural "$n" 'stack'); fi
-    if ((${#wt_path[@]} > 0)); then
-      printf 'Type "%s" to delete, or "%s w" to delete the worktrees too: ' "$phrase" "$phrase"
-    else
-      printf 'Type "%s" to delete: ' "$phrase"
-    fi
-    read -r answer </dev/tty || answer=
-    if ((${#wt_path[@]} > 0)) && [[ $answer == "$phrase w" ]]; then
-      with_worktrees=1
-    elif [[ $answer != "$phrase" ]]; then
-      return 0
-    fi
-  elif ((${#wt_path[@]} == 0)); then
-    confirm 'Continue?' || return 0
-  else
-    printf '[y: stacks only, w: and worktrees, N: no] '
-    read_key
-    case $KEY in
-      y | Y) ;;
-      w | W) with_worktrees=1 ;;
-      *) return 0 ;;
-    esac
-  fi
-
-  for ((i = 0; i < n; i++)); do
-    add_step '' "delete stack ${projects[i]}" stack_down "${projects[i]}" "$with_volumes"
-  done
-  if [[ -n $with_worktrees ]]; then
-    for ((k = 0; k < ${#wt_path[@]}; k++)); do
-      after=
-      for ((i = 0; i < n; i++)); do
-        if ((owner[i] == k)); then after="$after $i"; fi
-      done
-      add_step "$after" "delete worktree $(basename "${wt_path[k]}")" remove_worktree "${wt_path[k]}" "${wt_common[k]}"
-    done
-  fi
+  (($# > 0)) || return 0
+  plan_delete_stacks "$with_volumes" '' "$@"
+  prompt_delete_stacks "$with_volumes" || return 0
+  plan_queue "$CHOSEN"
   run_steps || true
   refresh_disk
 }
@@ -1269,9 +2409,11 @@ delete_stacks() {
 pick_stack() {
   require_fzf
   command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
-  docker info >/dev/null 2>&1 || die "Docker is not running"
-  local selected count title action tap='' layout
+  local selected count title action tap='' layout status=0 list
+  limited "$DOCKER_READ_LIMIT" docker info >/dev/null 2>&1 || status=$?
+  ((status == 0)) || die "$(docker_problem "$status")"
   export WTREE_SELF=$0
+  list=$(list_title stack)
   if disk_is_old; then refresh_disk; fi
   while :; do
     layout=(--height=80% --header=$'tab: select   ctrl-a: select all   enter: open   ctrl-s: stop\nctrl-d: delete   ctrl-f: delete with volumes   ctrl-r: reload   esc: quit')
@@ -1280,18 +2422,20 @@ pick_stack() {
     elif is_narrow; then
       layout=(--height=100% --no-scrollbar --bind='left-click:accept' --header=$'enter: menu   tab: select\nctrl-r: reload   esc: quit')
     fi
-    selected=$(: | SHELL=$(command -v bash) fzf \
+    selected=$(SHELL=$(command -v bash) fzf \
       --read0 --print0 --multi --ansi --highlight-line --header-lines=2 \
       --layout=reverse --info=inline \
-      --prompt="$(is_global && printf 'all stacks' || printf 'stack') > " \
+      --prompt="$list … > " \
       --delimiter=$'\t' --with-nth=3 \
       "${layout[@]}" \
-      --bind='start:reload("$WTREE_SELF" --stack-list)' \
+      --bind="start:unbind($GATED_KEYS)" \
+      --bind="load:$(gated_load "$list")" \
       --bind='ctrl-a:toggle-all' \
-      --bind='ctrl-s:execute("$WTREE_SELF" --stack-stop {+1})+reload("$WTREE_SELF" --stack-list)' \
-      --bind='ctrl-d:execute("$WTREE_SELF" --stack-delete {+1} {+2})+reload("$WTREE_SELF" --stack-list)' \
-      --bind='ctrl-f:execute("$WTREE_SELF" --stack-purge {+1} {+2})+reload("$WTREE_SELF" --stack-list)' \
-      --bind='ctrl-r:reload("$WTREE_SELF" --stack-list)' | tr '\0' '\036') || {
+      --bind='ctrl-s:execute("$WTREE_SELF" --stack-stop {+s1})+'"$(gated_reload "$list" --stack-list)" \
+      --bind='ctrl-d:execute("$WTREE_SELF" --stack-delete {+s1} {+s2})+'"$(gated_reload "$list" --stack-list)" \
+      --bind='ctrl-f:execute("$WTREE_SELF" --stack-purge {+s1} {+s2})+'"$(gated_reload "$list" --stack-list)" \
+      --bind="ctrl-r:$(gated_reload "$list" --stack-list)" \
+      --bind="click-header:$(gated_reload "$list" --stack-list)" < <("$WTREE_SELF" --stack-list 2>/dev/null) | tr '\0' '\036') || {
       fzf_exit $?
       continue
     }
@@ -1323,9 +2467,1949 @@ pick_stack() {
   done
 }
 
+# ---- the core contract: docs/core-contract.md is the reference, and it stays in step with this code
+
+# Sets J to the JSON string of a value, with quotes. Pure Bash and no subprocess. core_main sets LC_ALL=C
+# so that one character is one byte here. A byte that is not valid UTF-8 becomes U+FFFD and sets
+# J_LOSSY, because JSON cannot carry it, and a consumer cannot send that value back.
+json_set() {
+  local s=$1 out='' i=0 len c n need lo hi k d
+  J_LOSSY=''
+  case $s in
+    *[\"\\]* | *[![:print:]]*) ;;
+    *)
+      J="\"$s\""
+      return 0
+      ;;
+  esac
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  case $s in
+    *[![:print:]]*) ;;
+    *)
+      J="\"$s\""
+      return 0
+      ;;
+  esac
+  len=${#s}
+  while ((i < len)); do
+    c=${s:i:1}
+    i=$((i + 1))
+    case $c in
+      [[:print:]])
+        out+=$c
+        continue
+        ;;
+    esac
+    printf -v n '%d' "'$c"
+    if ((n < 0)); then n=$((n + 256)); fi
+    if ((n < 128)); then
+      printf -v c '\\u%04x' "$n"
+      out+=$c
+      continue
+    fi
+    need=0
+    lo=128
+    hi=191
+    if ((n >= 194 && n <= 223)); then
+      need=1
+    elif ((n >= 224 && n <= 239)); then
+      need=2
+      if ((n == 224)); then lo=160; elif ((n == 237)); then hi=159; fi
+    elif ((n >= 240 && n <= 244)); then
+      need=3
+      if ((n == 240)); then lo=144; elif ((n == 244)); then hi=143; fi
+    fi
+    if ((need == 0 || i + need > len)); then
+      out+=$'\357\277\275'
+      J_LOSSY=1
+      continue
+    fi
+    # the first byte after the lead has its own range, which rules out overlong forms and surrogates
+    for ((k = 0; k < need; k++)); do
+      d=${s:i+k:1}
+      printf -v d '%d' "'$d"
+      if ((d < 0)); then d=$((d + 256)); fi
+      if ((d < lo || d > hi)); then
+        out+=$'\357\277\275'
+        J_LOSSY=1
+        need=-1
+        break
+      fi
+      lo=128
+      hi=191
+    done
+    if ((need < 0)); then continue; fi
+    out+=${s:i-1:need+1}
+    i=$((i + need))
+  done
+  J="\"$out\""
+}
+
+json_str() {
+  json_set "$1"
+  printf '%s' "$J"
+}
+
+# a small builder: jb_new, then the fields, then jb_obj sets J to the object. Build inner objects first.
+jb_new() {
+  JB=''
+}
+
+jb_s() {
+  json_set "$2"
+  JB+="${JB:+,}\"$1\":$J"
+}
+
+# an empty value is null
+jb_sn() {
+  if [[ -n $2 ]]; then jb_s "$1" "$2"; else JB+="${JB:+,}\"$1\":null"; fi
+}
+
+# a number comes from a read, so it is checked here. Anything else is null.
+jb_n() {
+  case $2 in
+    '' | *[!0-9.-]* | *.*.* | *-*-* | ?*-* | .* | *. | - | 0[0-9]* | -0[0-9]*) JB+="${JB:+,}\"$1\":null" ;;
+    *) JB+="${JB:+,}\"$1\":$2" ;;
+  esac
+}
+
+jb_b() {
+  if [[ -n $2 ]]; then JB+="${JB:+,}\"$1\":true"; else JB+="${JB:+,}\"$1\":false"; fi
+}
+
+jb_r() {
+  JB+="${JB:+,}\"$1\":$2"
+}
+
+jb_obj() {
+  J="{$JB}"
+}
+
+# args: one value on each line. Sets J to a JSON array of strings.
+json_lines() {
+  local line out=''
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    json_set "$line"
+    out+="${out:+,}$J"
+  done <<<"$1"
+  J="[$out]"
+}
+
+# args: code, message. It writes one JSON line and ends with the number of the code.
+core_die() {
+  local status
+  case $1 in
+    usage) status=2 ;;
+    not_a_repo | docker_down) status=3 ;;
+    *) status=1 ;;
+  esac
+  jb_new
+  jb_n v 1
+  jb_s event error
+  jb_s code "$1"
+  jb_s message "$2"
+  jb_obj
+  printf '%s\n' "$J"
+  exit "$status"
+}
+
+# args: code, message, and optionally the plan. The status is 4.
+core_refuse() {
+  jb_new
+  jb_n v 1
+  jb_s event refused
+  jb_s code "$1"
+  jb_s message "$2"
+  if [[ -n ${3:-} ]]; then jb_r plan "$3"; fi
+  jb_obj
+  printf '%s\n' "$J"
+  exit 4
+}
+
+now_ms() {
+  local now=${EPOCHREALTIME:-}
+  if [[ -n $now ]]; then
+    now=${now/[.,]/}
+    NOW_MS=$((${now:0:${#now}-3}))
+  else
+    NOW_MS=$(($(date +%s) * 1000))
+  fi
+}
+
+# ---- core plan and core apply
+
+# adds one consequence to the out of item_consequences
+con() {
+  jb_new
+  jb_s code "$1"
+  jb_s text "$2"
+  jb_b severe "${3:-}"
+  jb_obj
+  out+="${out:+,}$J"
+}
+
+# what one item costs, for the sheet of a UI. Sets J to a JSON array.
+item_consequences() {
+  local i=$1 out='' k
+  case ${ITEM_KIND[i]} in
+    worktree)
+      if [[ -n ${ITEM_GO[i]} ]]; then
+        if [[ ${ITEM_NOTE[i]} == 'its directory is missing'* ]]; then
+          con missing_dir 'its directory is missing, and only the entry of git goes'
+          if [[ ${ITEM_NOTE[i]} != 'its directory is missing' ]]; then con force_note "${ITEM_NOTE[i]}" 1; fi
+        elif [[ -n $PLAN_FORCE ]]; then
+          con force_loss 'Changed files, untracked files, ignored files, and commits that no branch or tag holds are lost.' 1
+          if [[ -n ${ITEM_NOTE[i]} ]]; then con force_note "${ITEM_NOTE[i]}" 1; fi
+          if [[ -n ${ITEM_NESTED[i]} ]]; then con nested_repo_lost 'Another git repo inside this worktree is deleted too, with all its commits.' 1; fi
+        else
+          con ignored_files 'Ignored files, such as .env and node_modules, are deleted too.'
+        fi
+      fi
+      ;;
+    stack)
+      if [[ -n ${ITEM_GO[i]} ]]; then
+        if [[ $PLAN_ACTION == stop-stacks ]]; then
+          con containers_stopped 'Its containers stop. They can start again.'
+        else
+          con containers_removed 'Its containers and networks are deleted.'
+          for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+            if ((PST_ITEM[k] == i)) && [[ -n ${PST_ELSEWHERE[k]} ]]; then
+              con runs_elsewhere "It also runs in $(printf '%s' "${PST_ELSEWHERE[k]}" | tr '\n' ' ')and its containers there go too." 1
+            fi
+          done
+        fi
+      fi
+      ;;
+  esac
+  J="[$out]"
+}
+
+disk_bytes_of() {
+  local file
+  file="$(cache_dir)/disk-projects"
+  [[ -f $file ]] || return 0
+  awk -F'\t' -v p="$1" '$1 == p { print $2; exit }' "$file"
+}
+
+# adds one note to the notes of plan_json
+note() {
+  jb_new
+  jb_s code "$1"
+  jb_s text "$2"
+  jb_obj
+  notes+="${notes:+,}$J"
+}
+
+# sets PLAN_JSON. The prompts of the fzf UI read the same arrays.
+plan_json() {
+  local i s c k d items='' steps='' choices='' notes='' list inner phrase want default_confirm='' ids nl=$'\n'
+  plan_fingerprint
+  for ((i = 0; i < ${#ITEM_ID[@]}; i++)); do
+    item_consequences "$i"
+    inner=$J
+    ids=''
+    for ((s = 0; s < ${#PS_KIND[@]}; s++)); do
+      if ((PS_ITEM[s] == i)); then
+        json_set "s$((s + 1))"
+        ids+="${ids:+,}$J"
+      fi
+    done
+    jb_new
+    jb_s id "${ITEM_ID[i]}"
+    jb_s kind "${ITEM_KIND[i]}"
+    jb_s label "${ITEM_LABEL[i]}"
+    jb_b go "${ITEM_GO[i]}"
+    jb_b offered "${ITEM_OFFERED[i]}"
+    local tmp_item=$JB
+    if [[ -n ${ITEM_CODE[i]} ]]; then
+      jb_new
+      jb_s code "${ITEM_CODE[i]}"
+      jb_s text "${ITEM_TEXT[i]}"
+      jb_obj
+      JB=$tmp_item
+      jb_r reason "$J"
+    fi
+    if [[ -n ${ITEM_FORCE_OK[i]} ]]; then jb_b force_ok 1; fi
+    if [[ -n ${ITEM_NOTE[i]} ]]; then jb_s note "${ITEM_NOTE[i]}"; fi
+    if [[ -n ${ITEM_CODES[i]} ]]; then
+      json_lines "${ITEM_CODES[i]// /$nl}"
+      jb_r codes "$J"
+    fi
+    if [[ -n ${ITEM_PATH[i]} ]]; then jb_s path "${ITEM_PATH[i]}"; fi
+    if [[ -n ${ITEM_COMMON[i]} ]]; then jb_s common "${ITEM_COMMON[i]}"; fi
+    if [[ $PLAN_ACTION == delete-stacks && ${ITEM_KIND[i]} == stack ]] && ((PLAN_PAIRS_STATUS == 0)); then
+      for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+        if ((PST_ITEM[k] == i)) && [[ -z ${PST_DIRS[k]} ]]; then jb_b only_volumes 1; fi
+      done
+    fi
+    jb_r consequences "$inner"
+    jb_r steps "[$ids]"
+    jb_obj
+    items+="${items:+,}$J"
+  done
+  for ((s = 0; s < ${#PS_KIND[@]}; s++)); do
+    list=''
+    for d in ${PS_AFTER[s]}; do
+      json_set "s$((d + 1))"
+      list+="${list:+,}$J"
+    done
+    jb_new
+    jb_s id "s$((s + 1))"
+    jb_s label "${PS_LABEL[s]}"
+    jb_s kind "${PS_KIND[s]}"
+    jb_s item "${ITEM_ID[PS_ITEM[s]]}"
+    jb_b force "${PS_FORCE[s]}"
+    jb_b volumes "${PS_WITH_VOLUMES[s]}"
+    jb_r after "[$list]"
+    jb_obj
+    steps+="${steps:+,}$J"
+  done
+  for ((c = 0; c < ${#CHOICE_ID[@]}; c++)); do
+    # the phrases, in the order that apply expects them
+    list=''
+    want=${CHOICE_PHRASES[c]}
+    while [[ -n $want ]]; do
+      phrase=${want%%$'\037'*}
+      if [[ $want == *$'\037'* ]]; then want=${want#*$'\037'}; else want=''; fi
+      jb_new
+      jb_s phrase "$phrase"
+      jb_s hint "Type \"$phrase\" to delete"
+      jb_obj
+      list+="${list:+,}$J"
+    done
+    jb_new
+    jb_s kind "${CHOICE_CONFIRM[c]}"
+    jb_r phrases "[$list]"
+    jb_obj
+    inner=$J
+    if ((c == 0)); then default_confirm=$J; fi
+    ids=''
+    for s in ${CHOICE_STEPS[c]}; do
+      json_set "s$((s + 1))"
+      ids+="${ids:+,}$J"
+    done
+    list=''
+    for d in ${CHOICE_ADDS[c]}; do
+      json_set "${ITEM_ID[d]}"
+      list+="${list:+,}$J"
+    done
+    # what this choice adds to the items: volume data is the one loss that hangs on a choice
+    local cons=''
+    if [[ -n ${CHOICE_VOLUMES[c]} && -n ${CHOICE_AVAILABLE[c]} ]]; then
+      for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+        local names_json bytes
+        json_lines "${PST_VOLUMES[k]}"
+        names_json=$J
+        bytes=$(disk_bytes_of "${PST_NAME[k]}")
+        jb_new
+        jb_s code volumes_removed
+        jb_s item "stack:${PST_NAME[k]}"
+        jb_s text "${PST_NAME[k]}: $(plural "${PST_VCOUNT[k]}" 'volume') deleted. The data in the volumes is lost."
+        jb_b severe 1
+        jb_n count "${PST_VCOUNT[k]}"
+        jb_r names "$names_json"
+        jb_n bytes "$bytes"
+        jb_b protected "${PST_PROTECTED[k]}"
+        jb_obj
+        cons+="${cons:+,}$J"
+      done
+    fi
+    jb_new
+    jb_s id "${CHOICE_ID[c]}"
+    jb_s text "${CHOICE_TEXT[c]}"
+    if ((c == 0)); then jb_b default 1; else jb_b default ''; fi
+    jb_b available "${CHOICE_AVAILABLE[c]}"
+    if [[ -n ${CHOICE_REASON[c]} ]]; then jb_s reason "${CHOICE_REASON[c]}"; fi
+    jb_r adds "[$list]"
+    jb_r steps "[$ids]"
+    jb_r confirm "$inner"
+    jb_r consequences "[$cons]"
+    jb_obj
+    choices+="${choices:+,}$J"
+  done
+  if [[ -n $PLAN_REFUSAL ]]; then note docker_unavailable "$PLAN_REFUSAL"; elif [[ -n $PLAN_DOCKER_NOTE ]]; then note docker_unavailable "$PLAN_DOCKER_NOTE"; fi
+  case $PLAN_ACTION in
+    delete-worktrees)
+      if ((${#PW_ITEM[@]} > 0)); then
+        if [[ -n $PLAN_FORCE ]]; then
+          note force_loss 'Changed files, untracked files, ignored files, and commits that no branch or tag holds are lost.'
+        else
+          note ignored_files 'Ignored files, such as .env and node_modules, are deleted too.'
+        fi
+      fi
+      ;;
+    delete-stacks)
+      if [[ -z $PLAN_VOLUMES ]]; then note volumes_stay 'The volumes stay.'; fi
+      ;;
+  esac
+  jb_new
+  jb_b force "$PLAN_FORCE"
+  jb_b volumes "$PLAN_VOLUMES"
+  jb_obj
+  local flags=$J
+  if [[ -z $default_confirm ]]; then
+    jb_new
+    jb_s kind none
+    jb_r phrases '[]'
+    jb_obj
+    default_confirm=$J
+  fi
+  jb_new
+  jb_n v 1
+  jb_s plan_id "$PLAN_ID"
+  jb_s action "$PLAN_ACTION"
+  jb_r flags "$flags"
+  jb_s cwd "$PLAN_CWD"
+  jb_r items "[$items]"
+  jb_r steps "[$steps]"
+  jb_r choices "[$choices]"
+  jb_r confirm "$default_confirm"
+  jb_r notes "[$notes]"
+  if ((${#CHOICE_ID[@]} == 0)) || [[ -n $PLAN_REFUSAL ]]; then jb_b nothing_to_do 1; else jb_b nothing_to_do ''; fi
+  jb_obj
+  PLAN_JSON=$J
+}
+
+# sets CA_*: what plan and apply share
+core_parse_action() {
+  local where=$1
+  shift
+  (($# > 0)) || core_die usage "core $where needs an action: delete-worktrees, delete-stacks, stop-stacks or open"
+  CA_ACTION=$1
+  shift
+  CA_FORCE=''
+  CA_VOLUMES=''
+  CA_CWD=''
+  CA_PLAN=''
+  CA_CHOICE=''
+  CA_REPOS=()
+  CA_DIRS=()
+  CA_PHRASES=()
+  CA_TARGETS=()
+  case $CA_ACTION in
+    delete-worktrees | delete-stacks | stop-stacks | open) ;;
+    *) core_die usage "unknown action: $CA_ACTION" ;;
+  esac
+  while (($# > 0)); do
+    case $1 in
+      --force)
+        [[ $CA_ACTION == delete-worktrees ]] || core_die usage "--force goes with delete-worktrees"
+        CA_FORCE=force
+        ;;
+      --volumes)
+        [[ $CA_ACTION == delete-stacks ]] || core_die usage "--volumes goes with delete-stacks"
+        CA_VOLUMES=volumes
+        ;;
+      --cwd | --repo | --dir | --plan | --choice | --phrase)
+        (($# >= 2)) || core_die usage "$1 needs a value"
+        if [[ $where == plan ]]; then
+          case $1 in --plan | --choice | --phrase) core_die usage "$1 goes with core apply" ;; esac
+        fi
+        case $1 in
+          --cwd) CA_CWD=$2 ;;
+          --repo) CA_REPOS[${#CA_REPOS[@]}]=$2 ;;
+          --dir) CA_DIRS[${#CA_DIRS[@]}]=$2 ;;
+          --plan) CA_PLAN=$2 ;;
+          --choice) CA_CHOICE=$2 ;;
+          --phrase) CA_PHRASES[${#CA_PHRASES[@]}]=$2 ;;
+        esac
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *) core_die usage "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  while (($# > 0)); do
+    CA_TARGETS[${#CA_TARGETS[@]}]=$1
+    shift
+  done
+  ((${#CA_TARGETS[@]} > 0)) || core_die usage "core $where $CA_ACTION needs targets after --"
+  if ((${#CA_REPOS[@]} > 0 && ${#CA_REPOS[@]} != ${#CA_TARGETS[@]})); then core_die usage "--repo comes once for each target, or not at all"; fi
+  if ((${#CA_DIRS[@]} > 0 && ${#CA_DIRS[@]} != ${#CA_TARGETS[@]})); then core_die usage "--dir comes once for each target, or not at all"; fi
+  if ((${#CA_REPOS[@]} > 0)) && [[ $CA_ACTION != delete-worktrees ]]; then core_die usage "--repo goes with delete-worktrees"; fi
+  if ((${#CA_DIRS[@]} > 0)) && [[ $CA_ACTION != delete-stacks ]]; then core_die usage "--dir goes with delete-stacks"; fi
+  core_enter_cwd "$CA_CWD"
+}
+
+core_enter_cwd() {
+  if [[ -n $1 ]]; then cd "$1" 2>/dev/null || core_die not_a_repo "the directory does not exist: $1"; fi
+}
+
+# the same inputs give the same plan, for core plan and for core apply
+core_compute_plan() {
+  local i common commons=()
+  case $CA_ACTION in
+    delete-worktrees)
+      for ((i = 0; i < ${#CA_TARGETS[@]}; i++)); do
+        if ((${#CA_REPOS[@]} > 0)); then
+          common=${CA_REPOS[i]}
+        else
+          # a worktree whose directory is gone has no repo to ask, so try the repo of this directory
+          common=$(common_of "${CA_TARGETS[i]}") || common=$(common_of .) || common=''
+        fi
+        commons[i]=$common
+      done
+      plan_delete_worktrees "$CA_FORCE" "${CA_TARGETS[@]}" "${commons[@]}"
+      ;;
+    delete-stacks)
+      if ((${#CA_DIRS[@]} > 0)); then
+        plan_delete_stacks "$CA_VOLUMES" '' "${CA_TARGETS[@]}" "${CA_DIRS[@]}"
+      else
+        plan_delete_stacks "$CA_VOLUMES" labels "${CA_TARGETS[@]}" "${CA_TARGETS[@]}"
+      fi
+      ;;
+    stop-stacks) plan_stop_stacks "${CA_TARGETS[@]}" ;;
+    open) plan_open '' "${CA_TARGETS[@]}" ;;
+  esac
+}
+
+core_plan() {
+  core_parse_action plan "$@"
+  core_compute_plan
+  plan_json
+  printf '%s\n' "$PLAN_JSON"
+}
+
+core_apply() {
+  local c='' typed
+  core_parse_action apply "$@"
+  [[ -n $CA_PLAN ]] || core_die usage "core apply needs --plan"
+  core_compute_plan
+  plan_json
+  if [[ $PLAN_ID != "$CA_PLAN" ]]; then
+    core_refuse plan_stale 'The state changed after the plan. Nothing was done. This is the new plan.' "$PLAN_JSON"
+  fi
+  if ((${#CHOICE_ID[@]} == 0)) || [[ -n $PLAN_REFUSAL ]]; then
+    core_refuse nothing_to_do "${PLAN_REFUSAL:-This plan has nothing to do.}"
+  fi
+  if [[ -n $CA_CHOICE ]]; then
+    c=$(plan_choice_index "$CA_CHOICE") || core_refuse bad_choice "This plan has no choice $CA_CHOICE"
+  elif [[ ${CHOICE_CONFIRM[0]} == none ]]; then
+    c=0
+  else
+    core_refuse no_choice 'This plan needs a --choice.'
+  fi
+  if [[ -z ${CHOICE_AVAILABLE[c]} ]]; then core_refuse choice_unavailable "${CHOICE_REASON[c]:-This choice is not available.}"; fi
+  plan_authorize "$c" ${CA_PHRASES[@]+"${CA_PHRASES[@]}"} || core_refuse phrase_mismatch 'The phrases do not match this plan. Nothing was done.'
+  plan_queue "$c"
+  APPLY_REFRESH=''
+  for typed in ${CHOICE_STEPS[c]}; do
+    case ${PS_KIND[typed]} in stack_down) APPLY_REFRESH=1 ;; esac
+  done
+  run_steps_ndjson
+}
+
+core_emit_line() {
+  printf '%s\n' "$1"
+}
+
+# the same dependencies as run_steps, and events in place of a screen. A TERM stops it before the next
+# step, and the step that runs goes on: send it to this process and not to its group.
+run_steps_ndjson() {
+  local i dep because pid status log started total=$STEP_COUNT ok=0 failed=0 skipped=0 line partial ids s tail_json cancelled='' first_dep
+  APPLY_CANCELLED=''
+  trap 'APPLY_CANCELLED=1' TERM INT
+  log=$(mktemp 2>/dev/null) || core_die internal "wtree cannot make a temporary file in ${TMPDIR:-/tmp}, and nothing ran"
+  CORE_LOG=$log
+  CORE_LOG_OWNER=${BASHPID:-}
+  APPLY_REFRESH_DUE=''
+  trap core_steps_exit EXIT
+  jb_new
+  jb_n v 1
+  jb_s event start
+  jb_s plan_id "$PLAN_ID"
+  jb_n steps "$total"
+  jb_obj
+  core_emit_line "$J"
+  for ((i = 0; i < total; i++)); do
+    s=${STEP_PLAN[i]}
+    ids="s$((s + 1))"
+    because=''
+    first_dep=''
+    for dep in ${STEP_AFTER[i]}; do
+      # steps run in order, so the lowest one is the first that failed
+      if [[ ${STEP_RESULT[dep]} != ok ]] && { [[ -z $first_dep ]] || ((dep < first_dep)); }; then first_dep=$dep; fi
+    done
+    if [[ -n $first_dep ]]; then because="s$((STEP_PLAN[first_dep] + 1))"; fi
+    if [[ -n $APPLY_CANCELLED ]]; then because=cancelled; fi
+    if [[ -n $because ]]; then
+      STEP_RESULT[i]=skipped
+      skipped=$((skipped + 1))
+      jb_new
+      jb_n v 1
+      jb_s event step
+      jb_s id "$ids"
+      jb_s state skipped
+      jb_s because "$because"
+      jb_obj
+      core_emit_line "$J"
+      continue
+    fi
+    jb_new
+    jb_n v 1
+    jb_s event step
+    jb_s id "$ids"
+    jb_s state running
+    jb_s label "${STEP_LABEL[i]}"
+    jb_obj
+    core_emit_line "$J"
+    if [[ ${PS_KIND[s]} == stack_down ]]; then APPLY_REFRESH_DUE=1; fi
+    : >"$log"
+    now_ms
+    started=$NOW_MS
+    (
+      trap - TERM INT
+      core_restore_locale
+      eval "${STEP_CMD[i]}"
+    ) </dev/null >"$log" 2>&1 &
+    pid=$!
+    exec 3<"$log"
+    partial=''
+    while :; do
+      while IFS= read -r line <&3 || { partial+=$line; line=''; false; }; do
+        step_output "$ids" "$partial$line"
+        partial=''
+      done
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    while IFS= read -r line <&3 || { partial+=$line; line=''; false; }; do
+      step_output "$ids" "$partial$line"
+      partial=''
+    done
+    if [[ -n $partial ]]; then step_output "$ids" "$partial"; fi
+    exec 3<&-
+    status=0
+    wait "$pid" || status=$?
+    now_ms
+    jb_new
+    jb_n v 1
+    jb_s event step
+    jb_s id "$ids"
+    if ((status == 0)); then
+      STEP_RESULT[i]=ok
+      ok=$((ok + 1))
+      jb_s state ok
+      jb_n ms "$((NOW_MS - started))"
+    else
+      STEP_RESULT[i]=failed
+      failed=$((failed + 1))
+      json_lines "$(tail -n 8 "$log")"
+      tail_json=$J
+      jb_s state failed
+      jb_n ms "$((NOW_MS - started))"
+      jb_n status "$status"
+      jb_r tail "$tail_json"
+    fi
+    jb_obj
+    core_emit_line "$J"
+  done
+  rm -f "$log"
+  APPLY_REFRESH_DUE=''
+  if [[ -n $APPLY_CANCELLED ]]; then cancelled=1; fi
+  trap - TERM INT
+  if [[ -n ${APPLY_REFRESH:-} ]]; then refresh_disk; fi
+  jb_new
+  jb_n v 1
+  jb_s event end
+  jb_n ok "$ok"
+  jb_n failed "$failed"
+  jb_n skipped "$skipped"
+  jb_b disk_refresh "${APPLY_REFRESH:-}"
+  jb_b cancelled "$cancelled"
+  jb_obj
+  core_emit_line "$J"
+  if ((failed > 0)) || [[ -n $cancelled ]]; then return 1; fi
+}
+
+# a closed pipe or a HUP ends run_steps_ndjson between two steps: leave no file, and keep the sizes right
+# for a stack that went. A subshell that is killed just after its fork still has this trap.
+core_steps_exit() {
+  [[ ${BASHPID:-} == "${CORE_LOG_OWNER:-}" ]] || return 0
+  rm -f "$CORE_LOG"
+  if [[ -n ${APPLY_REFRESH_DUE:-} ]]; then
+    APPLY_REFRESH_DUE=''
+    refresh_disk || true
+  fi
+}
+
+step_output() {
+  jb_new
+  jb_n v 1
+  jb_s event output
+  jb_s id "$1"
+  jb_s line "$2"
+  jb_obj
+  core_emit_line "$J"
+}
+
+# the steps run with the language and the character set of the user
+core_restore_locale() {
+  if [[ -n ${WTREE_LC_ALL_WAS_SET:-} ]]; then export LC_ALL=$WTREE_LC_ALL_WAS; else unset LC_ALL; fi
+}
+
+core_open() {
+  local cwd=''
+  while (($# > 0)); do
+    case $1 in
+      --cwd)
+        (($# >= 2)) || core_die usage "--cwd needs a value"
+        cwd=$2
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *) core_die usage "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  (($# > 0)) || core_die usage "core open needs directories after --"
+  core_enter_cwd "$cwd"
+  plan_open every "$@"
+  plan_fingerprint
+  plan_queue 0
+  APPLY_REFRESH=''
+  run_steps_ndjson
+}
+
+# args: the main checkout. Sets NEW_NAME and NEW_PATH to a name that nothing uses.
+pick_new_worktree() {
+  local base attempt=0 listed
+  base="$(dirname "$1")/worktrees"
+  listed=$(limited "$GIT_QUICK_LIMIT" git -C "$1" worktree list --porcelain) || listed=
+  while :; do
+    NEW_NAME="${ADJECTIVES[RANDOM % ${#ADJECTIVES[@]}]}-${NOUNS[RANDOM % ${#NOUNS[@]}]}"
+    attempt=$((attempt + 1))
+    if ((attempt > 50)); then NEW_NAME="$NEW_NAME-$RANDOM"; fi
+    NEW_PATH="$base/$NEW_NAME"
+    if [[ ! -e $NEW_PATH ]] && ! grep -Fxq -- "worktree $NEW_PATH" <<<"$listed"; then break; fi
+  done
+}
+
+core_new() {
+  local cwd='' repo='' name='' no_open='' dry='' anchor main log status=0 head
+  while (($# > 0)); do
+    case $1 in
+      --cwd | --repo | --name)
+        (($# >= 2)) || core_die usage "$1 needs a value"
+        case $1 in
+          --cwd) cwd=$2 ;;
+          --repo) repo=$2 ;;
+          --name) name=$2 ;;
+        esac
+        shift
+        ;;
+      --no-open) no_open=1 ;;
+      --dry-run) dry=1 ;;
+      *) core_die usage "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  core_enter_cwd "$cwd"
+  anchor=${repo:-.}
+  main=$(main_of "$anchor")
+  [[ -n $main ]] || core_die not_a_repo "not a git repository: ${repo:-$PWD}"
+  if [[ -n $name ]]; then
+    case $name in
+      .* | -* | *[!A-Za-z0-9._-]*) core_refuse bad_name "A worktree name has only letters, digits, dots, dashes and underscores, and starts with a letter or a digit." ;;
+    esac
+    NEW_NAME=$name
+    NEW_PATH="$(dirname "$main")/worktrees/$name"
+    if [[ -e $NEW_PATH ]]; then core_refuse name_taken "This path already exists: $NEW_PATH"; fi
+  else
+    pick_new_worktree "$main"
+  fi
+  head=$(limited "$GIT_QUICK_LIMIT" git -C "$anchor" rev-parse HEAD 2>/dev/null) || head=''
+  if [[ -n $dry ]]; then
+    jb_new
+    jb_n v 1
+    jb_s event plan_new
+    jb_s path "$NEW_PATH"
+    jb_s name "$NEW_NAME"
+    jb_s head "$head"
+    jb_obj
+    printf '%s\n' "$J"
+    return 0
+  fi
+  log=$(mkdir -p "$(dirname "$NEW_PATH")" 2>&1) || core_die internal "wtree cannot make the directory of $NEW_PATH: $log"
+  log=$(git -C "$anchor" worktree add --quiet --detach "$NEW_PATH" HEAD 2>&1) || status=$?
+  if ((status != 0)); then core_die internal "git worktree add failed: $log"; fi
+  jb_new
+  jb_n v 1
+  jb_s event created
+  jb_s path "$NEW_PATH"
+  jb_s name "$NEW_NAME"
+  jb_s head "$head"
+  jb_obj
+  printf '%s\n' "$J"
+  if [[ -z $no_open ]]; then
+    plan_open every "$NEW_PATH"
+    plan_fingerprint
+    plan_queue 0
+    APPLY_REFRESH=''
+    run_steps_ndjson
+  fi
+}
+
+# ---- core list
+
+LIST_PS_FORMAT='{{.Label "com.docker.compose.project"}}\t{{.State}}\t{{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.service"}}\t{{.Status}}\t{{.Ports}}\t{{.Label "com.docker.compose.project.working_dir"}}'
+LIST_STATES=(running paused restarting created exited dead removing)
+
+# args: seconds, file, then the docker arguments. file.status gets the status, and the file stays only
+# when the read worked. The directory of a stack comes last in its row, so a tab cannot move a field.
+read_docker_status() {
+  local seconds=$1 file=$2 status=0
+  shift 2
+  limited "$seconds" docker "$@" >"$file" 2>/dev/null || status=$?
+  if ((status != 0)); then rm -f "$file"; fi
+  printf '%d' "$status" >"$file.status"
+}
+
+list_warning() {
+  jb_new
+  jb_s code "$1"
+  jb_s message "$2"
+  jb_obj
+  list_emit warning "$J" warnings flat
+}
+
+# args: the event, then its object, then the name of the array in a document, and flat if the fields of
+# the object are the fields of the event. Otherwise the object goes in a field with the name of the event.
+list_emit() {
+  local event=$1 object=$2 array=$3 shape=${4:-}
+  if [[ -n $LIST_STREAM ]]; then
+    if [[ $shape == flat ]]; then
+      printf '{"v":1,"event":"%s",%s\n' "$event" "${object:1}"
+    else
+      printf '{"v":1,"event":"%s","%s":%s}\n' "$event" "$event" "$object"
+    fi
+  else
+    printf '%s\n' "$object" >>"$WTREE_TMP/doc.$array"
+  fi
+}
+
+list_stage_on() {
+  [[ ,$LIST_ONLY, == *,$1,* ]]
+}
+
+list_stage_start() {
+  now_ms
+  LIST_STAGE_AT=$NOW_MS
+  if [[ -n $LIST_STREAM ]]; then printf '{"v":1,"event":"stage","stage":"%s"}\n' "$1"; fi
+}
+
+list_stage_end() {
+  now_ms
+  if [[ -n $LIST_STREAM ]]; then printf '{"v":1,"event":"stage","stage":"%s","done":true,"ms":%d}\n' "$1" "$((NOW_MS - LIST_STAGE_AT))"; fi
+}
+
+# prints the repos that the cache knows. The first scan can take long, so it goes on behind the list.
+list_known_repos() {
+  local file tries=0 max
+  file="$(cache_dir)/repos"
+  if [[ ! -f $file ]]; then
+    mkdir -p "$(cache_dir)"
+    (rescan_repos) </dev/null >/dev/null 2>&1 &
+    max=$((REPO_SCAN_WAIT * 10))
+    while [[ ! -f $file ]] && ((tries < max)); do
+      sleep 0.1
+      tries=$((tries + 1))
+    done
+    if [[ ! -f $file ]]; then
+      printf 'scan\n' >"$WTREE_TMP/scan-running"
+      return 0
+    fi
+  elif [[ -n $(find "$file" -mmin +30) ]]; then
+    (rescan_repos) </dev/null >/dev/null 2>&1 &
+  fi
+  cat "$file"
+}
+
+# adds one repo and all its worktrees, and emits them. arg: the git dir
+list_add_repo() {
+  local common=$1 first=1 path='' ref='' detached='' head='' lock='' has_lock='' bare='' prunable='' odd='' line text status=0 r name main_path='' refs default_ref='' default_short='' rows start i cwd_best=-1 cwd_len=0
+  for r in "${R_COMMON[@]+"${R_COMMON[@]}"}"; do
+    if [[ $r == "$common" ]]; then return 0; fi
+  done
+  rows=$(worktree_porcelain "$common") || status=$?
+  if ((status != 0)) || [[ -z $rows ]]; then
+    list_warning git_unreadable "git cannot read the worktrees of $common"
+    return 0
+  fi
+  start=${#W_PATH[@]}
+  local here=$PWD
+  while IFS= read -r line; do
+    case $line in
+      'worktree '*)
+        path=${line#worktree }
+        path=${path//$'\001'/$'\n'}
+        path=${path//$'\002'/$'\t'}
+        ref=''
+        detached=''
+        head=''
+        lock=''
+        has_lock=''
+        bare=''
+        prunable=''
+        odd=''
+        ;;
+      'HEAD '*) head=${line#HEAD } ;;
+      'branch '*)
+        ref=${line#branch }
+        ref=${ref#refs/heads/}
+        ;;
+      detached) detached=1 ;;
+      prunable*) prunable=1 ;;
+      locked*)
+        has_lock=1
+        lock=${line#locked}
+        lock=${lock# }
+        lock=${lock//$'\001'/ }
+        lock=${lock//$'\002'/ }
+        ;;
+      bare) bare=1 ;;
+      '')
+        [[ -n $path ]] || continue
+        i=${#W_PATH[@]}
+        W_PATH[i]=$path
+        # as real_dir, with no fork: this runs for each worktree before the first row can show
+        W_REAL[i]=$path
+        if cd -P -- "$path" 2>/dev/null; then
+          W_REAL[i]=$PWD
+          cd -- "$here" 2>/dev/null || true
+        fi
+        W_COMMON[i]=$common
+        W_BRANCH[i]=$ref
+        W_DETACHED[i]=$detached
+        W_HEAD[i]=$head
+        W_LOCK[i]=$lock
+        W_HAS_LOCK[i]=$has_lock
+        W_BARE[i]=$bare
+        W_PRUNABLE[i]=$prunable
+        W_ODD[i]=$odd
+        W_MAIN[i]=$first
+        W_CURRENT[i]=''
+        if [[ -n $first ]]; then
+          main_path=$path
+          name=${path%/}
+          name=${name##*/}
+          name=${name%.git}
+          first=''
+        fi
+        W_REPO[i]=$name
+        path=''
+        ;;
+      *) odd=1 ;;
+    esac
+  done <<<"$rows"$'\n'
+  # the deepest worktree of this repo that holds the directory of the caller
+  for ((i = start; i < ${#W_PATH[@]}; i++)); do
+    path=${W_REAL[i]}
+    if [[ ($LIST_CWD == "$path" || $LIST_CWD == "$path"/*) && ${#path} -gt $cwd_len ]]; then
+      cwd_best=$i
+      cwd_len=${#path}
+    fi
+  done
+  if ((cwd_best >= 0)); then W_CURRENT[cwd_best]=1; fi
+
+  refs=$(limited "$GIT_READ_LIMIT" git -C "$common" for-each-ref --format='%(refname)%09%(symref)' refs/remotes/origin/HEAD refs/heads/main refs/heads/master 2>/dev/null) || refs=
+  default_ref=$(printf '%s\n' "$refs" | awk -F'\t' '
+    $1 == "refs/remotes/origin/HEAD" && $2 != "" { print $2; exit }
+    $1 == "refs/heads/main" { main = $1 }
+    $1 == "refs/heads/master" { master = $1 }
+    END { if (main != "") print main; else if (master != "") print master }' | head -n 1)
+  default_short=${default_ref#refs/remotes/origin/}
+  default_short=${default_short#refs/heads/}
+  r=${#R_COMMON[@]}
+  R_COMMON[r]=$common
+  R_DEFAULT_REF[r]=$default_ref
+  R_DEFAULT[r]=$default_short
+  if list_stage_on structure; then
+    jb_new
+    jb_s common "$common"
+    jb_s name "$name"
+    jb_s main "$main_path"
+    jb_sn default_branch "$default_short"
+    jb_obj
+    list_emit repo "$J" repos
+  fi
+  for ((i = start; i < ${#W_PATH[@]}; i++)); do
+    W_DEFAULT_REF[i]=$default_ref
+    W_DEFAULT[i]=$default_short
+    json_set "${W_PATH[i]}"
+    if [[ -n $J_LOSSY || ${W_PATH[i]} == *[$'\n\t']* ]]; then W_ODD[i]=1; fi
+    list_stage_on structure || continue
+    jb_new
+    jb_s path "${W_PATH[i]}"
+    jb_s common "$common"
+    jb_s repo "${W_REPO[i]}"
+    jb_b main "${W_MAIN[i]}"
+    jb_sn branch "${W_BRANCH[i]}"
+    jb_b detached "${W_DETACHED[i]}"
+    jb_sn head "${W_HEAD[i]}"
+    # git does not call a locked worktree prunable, also when its directory is gone
+    if [[ -n ${W_PRUNABLE[i]} || (-z ${W_BARE[i]} && ! -d ${W_PATH[i]}) ]]; then jb_b missing 1; else jb_b missing ''; fi
+    jb_b bare "${W_BARE[i]}"
+    if [[ -n ${W_HAS_LOCK[i]} ]]; then jb_s locked "${W_LOCK[i]}"; else jb_r locked null; fi
+    jb_b current "${W_CURRENT[i]}"
+    jb_b odd "${W_ODD[i]}"
+    jb_obj
+    list_emit worktree "$J" worktrees
+  done
+}
+
+# the index of a stack in SP_*, and a new stack if it has none. Sets SP_FOUND.
+list_stack_index() {
+  local k
+  for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+    if [[ ${SP_NAME[k]} == "$1" ]]; then
+      SP_FOUND=$k
+      return 0
+    fi
+  done
+  SP_FOUND=${#SP_NAME[@]}
+  SP_NAME[SP_FOUND]=$1
+  SP_KIND[SP_FOUND]=''
+  SP_DIR[SP_FOUND]=''
+  SP_DIRS[SP_FOUND]=''
+  SP_OWNERS[SP_FOUND]=''
+  SP_COUNTED[SP_FOUND]=''
+  SP_CONT[SP_FOUND]=''
+  SP_IDS[SP_FOUND]=''
+  SP_VOLS[SP_FOUND]=0
+  SP_BYTES[SP_FOUND]=''
+  SP_STALE[SP_FOUND]=''
+  SP_FINISHED[SP_FOUND]=''
+  SP_STARTED[SP_FOUND]=''
+  for ((k = 0; k < ${#LIST_STATES[@]}; k++)); do
+    SP_STATES[SP_FOUND * ${#LIST_STATES[@]} + k]=0
+  done
+}
+
+# reads the rows of docker ps into SP_*
+list_read_ps() {
+  local project state id names service status ports dir k i kind seen=$'\n' repo='' common='' health published part port nl=$'\n'
+  if ! is_global; then
+    common=$(common_of "$LIST_CWD") || common=
+    repo=$(basename "$(main_of "$LIST_CWD")" | tr '[:upper:]' '[:lower:]')
+  fi
+  while IFS=$'\037' read -r project state id names service status ports dir; do
+    dir=${dir//$'\037'/$'\t'}
+    if [[ -z $project || -z $id ]]; then
+      LIST_ODD_ROWS=$((LIST_ODD_ROWS + 1))
+      continue
+    fi
+    list_stack_index "$project"
+    k=$SP_FOUND
+    if [[ $seen != *$'\n'"$project"$'\037'"$dir"$'\n'* ]]; then
+      seen+="$project"$'\037'"$dir"$'\n'
+      SP_DIRS[k]+="$dir"$'\n'
+      kind=$(stack_kind "$project" "$dir" "$common" "$repo")
+      # the directory to show does not hang on the order of the rows
+      if [[ -n $kind ]] && [[ -z ${SP_KIND[k]} || ($kind == live && ${SP_KIND[k]} != live) || ($kind == "${SP_KIND[k]}" && $dir < "${SP_DIR[k]}") ]]; then
+        SP_KIND[k]=$kind
+        SP_DIR[k]=$dir
+      fi
+    fi
+    for ((i = 0; i < ${#LIST_STATES[@]}; i++)); do
+      if [[ ${LIST_STATES[i]} == "$state" ]]; then
+        SP_STATES[k * ${#LIST_STATES[@]} + i]=$((SP_STATES[k * ${#LIST_STATES[@]} + i] + 1))
+      fi
+    done
+    health=''
+    case $status in
+      *'(healthy)'*) health=healthy ;;
+      *'(unhealthy)'*) health=unhealthy ;;
+      *'(health: starting)'*) health=starting ;;
+    esac
+    published=''
+    part=$ports
+    while [[ -n $part ]]; do
+      port=${part%%,*}
+      if [[ $part == *,* ]]; then part=${part#*,}; part=${part# }; else part=''; fi
+      if [[ $port == *:*'->'* ]]; then
+        port=${port%%'->'*}
+        port=${port##*:}
+        case " $published " in
+          *" $port "*) ;;
+          *) published+="${published:+ }$port" ;;
+        esac
+      fi
+    done
+    jb_new
+    jb_s id "$id"
+    jb_s name "$names"
+    jb_s service "$service"
+    jb_s state "$state"
+    jb_sn health "$health"
+    jb_s status "$status"
+    jb_s ports "$ports"
+    json_lines "${published// /$nl}"
+    jb_r published "$J"
+    jb_obj
+    SP_CONT[k]+="${SP_CONT[k]:+,}$J"
+    SP_IDS[k]+="${SP_IDS[k]:+ }$id"
+    LIST_ALL_IDS+="${LIST_ALL_IDS:+ }$id"
+  done < <(tr '\t' '\037' <"$WTREE_TMP/ps")
+}
+
+# prints the index of the deepest worktree of the list that holds a resolved directory, or -1
+list_owner_of() {
+  local real=$1 i path best=-1 best_len=0
+  for ((i = 0; i < ${#W_REAL[@]}; i++)); do
+    path=${W_REAL[i]}
+    if [[ ($real == "$path" || $real == "$path"/*) && ${#path} -gt $best_len ]]; then
+      best=$i
+      best_len=${#path}
+    fi
+  done
+  printf '%d' "$best"
+}
+
+# emits the stacks in scope. A project with only volumes belongs to this scope by its name.
+list_emit_stacks() {
+  local k i line best dir repo='' lower volumes_known=$1 states owners
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    list_stack_index "$line"
+    SP_VOLS[SP_FOUND]=$((SP_VOLS[SP_FOUND] + 1))
+  done < <(if [[ -f $WTREE_TMP/volumes ]]; then cat "$WTREE_TMP/volumes"; fi)
+  if ! is_global; then repo=$(basename "$(main_of "$LIST_CWD")" | tr '[:upper:]' '[:lower:]'); fi
+  for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+    if [[ -z ${SP_IDS[k]} ]]; then
+      lower=$(printf '%s' "${SP_NAME[k]}" | tr '[:upper:]' '[:lower:]')
+      if is_global || [[ $lower == "$repo" || $lower == "$repo"-* ]]; then SP_KIND[k]=volumes; fi
+    fi
+    SP_OWNER[k]=-1
+    [[ -n ${SP_KIND[k]} ]] || continue
+    dir=${SP_DIR[k]}
+    best=-1
+    if [[ -n $dir ]]; then best=$(list_owner_of "$(real_dir "$dir")"); fi
+    SP_OWNER[k]=$best
+    # a project can run from several directories, and each of their worktrees has this stack
+    owners=''
+    SP_OWNERS[k]=''
+    while IFS= read -r line; do
+      [[ -n $line ]] || continue
+      i=$(list_owner_of "$(real_dir "$line")")
+      if ((i >= 0)) && [[ " ${SP_OWNERS[k]} " != *" $i "* ]]; then
+        SP_OWNERS[k]+="${SP_OWNERS[k]:+ }$i"
+      fi
+    done <<<"${SP_DIRS[k]}"
+    for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+      if [[ " ${SP_OWNERS[k]} " == *" $i "* ]]; then owners+="${W_PATH[i]}"$'\n'; fi
+    done
+    list_stage_on structure || continue
+    jb_new
+    for ((i = 0; i < ${#LIST_STATES[@]}; i++)); do
+      if ((SP_STATES[k * ${#LIST_STATES[@]} + i] > 0)); then jb_n "${LIST_STATES[i]}" "${SP_STATES[k * ${#LIST_STATES[@]} + i]}"; fi
+    done
+    jb_obj
+    states=$J
+    json_lines "$owners"
+    local owners_json=$J
+    json_lines "${SP_DIRS[k]}"
+    local dirs=$J
+    jb_new
+    jb_s project "${SP_NAME[k]}"
+    jb_sn dir "$dir"
+    jb_r dirs "$dirs"
+    jb_s kind "${SP_KIND[k]}"
+    if ((best >= 0)); then
+      jb_s worktree "${W_PATH[best]}"
+      jb_s common "${W_COMMON[best]}"
+    else
+      jb_r worktree null
+      jb_r common null
+    fi
+    jb_r worktrees "$owners_json"
+    jb_r states "$states"
+    jb_r containers "[${SP_CONT[k]}]"
+    if [[ -n $volumes_known ]]; then jb_n volumes "${SP_VOLS[k]}"; else jb_r volumes null; fi
+    jb_obj
+    list_emit stack "$J" stacks
+  done
+}
+
+list_stage_structure() {
+  local pid_ps='' pid_vol='' docker_status=127 volume_status=127 line dir known_dirs common i inside on=''
+  if list_stage_on structure; then
+    on=1
+    list_stage_start structure
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    # a job has its own files. With the stdout of the list, a consumer that kills the list and reads to
+    # the end would wait for it, and with its stderr, it would hear about files that the list removed.
+    read_docker_status "$DOCKER_READ_LIMIT" "$WTREE_TMP/ps" ps -a --filter label=com.docker.compose.project --format "$LIST_PS_FORMAT" >/dev/null 2>&1 &
+    pid_ps=$!
+    read_docker_status "$DOCKER_READ_LIMIT" "$WTREE_TMP/volumes" volume ls --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}' >/dev/null 2>&1 &
+    pid_vol=$!
+  fi
+  # the names come first, and a slow engine does not hold them back
+  if is_global; then
+    while IFS= read -r line; do
+      if [[ -n $line && -d $line ]]; then list_add_repo "$line"; fi
+    done <<<"$(list_known_repos)"
+    if [[ -f $WTREE_TMP/scan-running ]]; then list_warning repo_scan_running 'wtree still looks for repos. Reload the list later to see them all.'; fi
+  fi
+  common=$(common_of "$LIST_CWD") || common=
+  if [[ -n $common ]] && { ! is_global || [[ -z $(limited "$GIT_QUICK_LIMIT" git -C "$LIST_CWD" rev-parse --show-superproject-working-tree 2>/dev/null) ]]; }; then list_add_repo "$common"; fi
+
+  if [[ -n $pid_ps ]]; then
+    wait "$pid_ps" || true
+    wait "$pid_vol" || true
+    docker_status=$(cat "$WTREE_TMP/ps.status" 2>/dev/null) || docker_status=1
+    volume_status=$(cat "$WTREE_TMP/volumes.status" 2>/dev/null) || volume_status=1
+  fi
+  LIST_DOCKER_STATUS=$docker_status
+  if ((docker_status == 127)); then
+    list_warning docker_missing 'docker is not on PATH, so the list has no stacks.'
+  elif ((docker_status > 128)); then
+    list_warning docker_timeout "Docker did not answer within $DOCKER_READ_LIMIT seconds. Reload the list to try again."
+  elif ((docker_status != 0)); then
+    list_warning docker_down 'Docker is not running, so the list has no stacks.'
+  else
+    list_read_ps
+    if ((LIST_ODD_ROWS > 0)); then list_warning odd_stack_row "$LIST_ODD_ROWS rows of docker ps have a label that wtree cannot read."; fi
+    if ((volume_status == 0)); then LIST_VOLUMES_KNOWN=1; fi
+    if ((volume_status != 0)); then list_warning volumes_unavailable 'docker volume ls did not answer, so the counts of volumes are unknown.'; fi
+    # a stack can be outside the directories that the scan reads
+    if is_global; then
+      for ((i = 0; i < ${#SP_NAME[@]}; i++)); do
+        while IFS= read -r dir; do
+          [[ -n $dir && -d $dir ]] || continue
+          common=$(repo_of_dir "$dir")
+          if [[ -n $common ]]; then list_add_repo "$common"; fi
+        done <<<"${SP_DIRS[i]}"
+      done
+    fi
+    if ((volume_status == 0)); then list_emit_stacks 1; else list_emit_stacks ''; fi
+  fi
+  if [[ -n $on ]]; then list_stage_end structure; fi
+}
+
+# one git read of git_facts, with what is left of its time. A limit around all of git_facts could kill only
+# its subshell, and the git that hangs would stay behind.
+git_fact() {
+  local left=$((GF_DEADLINE - SECONDS))
+  if ((left <= 0)); then return 124; fi
+  limited "$left" git "$@"
+}
+
+# arg: the status of a read that failed. When the time ran out, git_facts stops, and its caller says so.
+git_fact_failed() {
+  if (($1 > 128)); then exit 124; fi
+}
+
+# prints the facts of one worktree: its JSON fields, then the same facts for the cleanup, separated by \037
+git_facts() {
+  local path=$1 common=$2 branch=$3 default_ref=$4 default_short=$5 changes hidden changed='' untracked='' unreadable='' last='' last_at='' subject='' track='' upstream='' gone='' ahead='' behind='' merged='' held='' head index mtime='' line holder status=0
+  GF_DEADLINE=$((SECONDS + GIT_FACTS_LIMIT))
+  if [[ ! -d $path ]]; then
+    jb_new
+    jb_s path "$path"
+    jb_b missing 1
+    jb_obj
+    printf '%s\n' "$J"
+    printf 'missing\037\037\037\037\037\n'
+    return 0
+  fi
+  changes=$(worktree_status "$path" "$GIT_FACTS_LIMIT") || status=$?
+  if ((status == 0)); then hidden=$(worktree_hidden_files "$path" "$((GF_DEADLINE - SECONDS))") || status=$?; fi
+  git_fact_failed "$status"
+  if ((status != 0)); then
+    unreadable=1
+  else
+    changed=0
+    untracked=0
+    while IFS= read -r line; do
+      [[ -n $line ]] || continue
+      changed=$((changed + 1))
+      case $line in '?? '*) untracked=$((untracked + 1)) ;; esac
+    done <<<"$changes"
+    while IFS= read -r line; do
+      if [[ -n $line ]]; then changed=$((changed + 1)); fi
+    done <<<"$hidden"
+  fi
+  last=$(git_fact -C "$path" log -1 --format='%ct%x09%s' 2>/dev/null) || {
+    git_fact_failed "$?"
+    last=
+  }
+  last_at=${last%%$'\t'*}
+  subject=${last#*$'\t'}
+  head=$(git_fact -C "$path" rev-parse HEAD 2>/dev/null) || {
+    git_fact_failed "$?"
+    head=
+  }
+  if [[ -n $branch ]]; then
+    track=$(git_fact -C "$common" for-each-ref --format='%(upstream:short)%09%(upstream:track)' "refs/heads/$branch" 2>/dev/null) || {
+      git_fact_failed "$?"
+      track=
+    }
+    upstream=${track%%$'\t'*}
+    track=${track#*$'\t'}
+    case $track in *gone*) gone=1 ;; esac
+    if [[ -n $upstream && -z $gone ]]; then
+      ahead=0
+      behind=0
+      if [[ $track =~ ahead\ ([0-9]+) ]]; then ahead=${BASH_REMATCH[1]}; fi
+      if [[ $track =~ behind\ ([0-9]+) ]]; then behind=${BASH_REMATCH[1]}; fi
+    fi
+  elif [[ -n $head && -z $unreadable ]]; then
+    holder=$(git_fact -C "$common" for-each-ref --count=1 --contains "$head" refs/heads refs/tags refs/remotes 2>/dev/null) || {
+      git_fact_failed "$?"
+      holder=
+    }
+    if [[ -n $holder ]]; then held=1; else held=no; fi
+  fi
+  if [[ -n $default_ref && -n $head && $branch != "$default_short" ]]; then
+    status=0
+    git_fact -C "$path" merge-base --is-ancestor "$head" "$default_ref" 2>/dev/null || status=$?
+    git_fact_failed "$status"
+    if ((status == 0)); then merged=$default_short; fi
+  fi
+  index=$(git_fact -C "$path" rev-parse --path-format=absolute --git-path index 2>/dev/null) || {
+    git_fact_failed "$?"
+    index=
+  }
+  if [[ -n $index && -f $index ]]; then mtime=$(date -r "$index" +%s 2>/dev/null) || mtime=; fi
+  jb_new
+  jb_s path "$path"
+  jb_b missing ''
+  jb_n changed "$changed"
+  jb_n untracked "$untracked"
+  jb_sn upstream "$upstream"
+  jb_b upstream_gone "$gone"
+  jb_n ahead "$ahead"
+  jb_n behind "$behind"
+  jb_n last_commit_at "$last_at"
+  jb_sn last_commit_subject "$subject"
+  jb_n index_mtime "$mtime"
+  jb_sn merged_into "$merged"
+  if [[ -n $unreadable ]]; then jb_r head_held null; elif [[ -n $branch ]]; then jb_r head_held true; elif [[ $held == 1 ]]; then jb_r head_held true; elif [[ $held == no ]]; then jb_r head_held false; else jb_r head_held null; fi
+  jb_b unreadable "$unreadable"
+  jb_b timed_out ''
+  jb_obj
+  printf '%s\n' "$J"
+  printf '%s\037%s\037%s\037%s\037%s\037%s\n' "$unreadable" "$changed" "$merged" "$gone" "$held" "$last_at"
+}
+
+# waits for the oldest job of list_stage_git, and emits what it read, so the order is the order of the list
+list_git_reap() {
+  local index=${running[reap]} facts f line
+  wait "${GIT_PID[index]}" || true
+  f=$WTREE_TMP/git.$index
+  IFS= read -r line <"$f" || line=''
+  if [[ -n $line ]]; then
+    list_emit worktree_git "$line" worktree_git flat
+    facts=$(tail -n 1 "$f")
+    IFS=$'\037' read -r G_UNREADABLE[index] G_CHANGED[index] G_MERGED[index] G_GONE[index] G_HELD[index] G_LAST[index] <<<"$facts"
+  fi
+  reap=$((reap + 1))
+}
+
+list_stage_git() {
+  local i n=${#W_PATH[@]} running=() reap=0
+  list_stage_start git
+  for ((i = 0; i < n; i++)); do
+    G_UNREADABLE[i]=''
+    G_CHANGED[i]=''
+    G_MERGED[i]=''
+    G_GONE[i]=''
+    G_HELD[i]=''
+    G_LAST[i]=''
+    G_TIMEOUT[i]=''
+    [[ -z ${W_BARE[i]} ]] || continue
+    running[${#running[@]}]=$i
+    (
+      f=$WTREE_TMP/git.$i
+      status=0
+      # git_facts keeps to its own limit, and this one is for what it cannot limit, such as a stat
+      limited "$((GIT_FACTS_LIMIT + 3))" git_facts "${W_PATH[i]}" "${W_COMMON[i]}" "${W_BRANCH[i]}" "${W_DEFAULT_REF[i]}" "${W_DEFAULT[i]}" >"$f" || status=$?
+      if ((status != 0)); then
+        jb_new
+        jb_s path "${W_PATH[i]}"
+        jb_b missing ''
+        jb_b unreadable 1
+        jb_b timed_out 1
+        jb_obj
+        {
+          printf '%s\n' "$J"
+          printf '1\037\037\037\037\037\n'
+        } >"$f"
+      fi
+    ) >/dev/null 2>&1 &
+    GIT_PID[i]=$!
+    if ((${#running[@]} - reap >= GIT_JOBS)); then list_git_reap; fi
+  done
+  while ((reap < ${#running[@]})); do list_git_reap; done
+  list_stage_end git
+}
+
+list_stage_stats() {
+  local stats_pid='' info_pid='' inspect_pid='' status k id ids_file ncpu mem line kind project a b c d now
+  list_stage_start stats
+  if ((LIST_DOCKER_STATUS != 0)); then
+    list_stage_end stats
+    return 0
+  fi
+  read_docker_status "$DOCKER_STATS_LIMIT" "$WTREE_TMP/stats" stats --no-stream --format '{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}' >/dev/null 2>&1 &
+  stats_pid=$!
+  # docker turns \t into a tab for ps and stats, but not for info and inspect
+  read_docker_status "$DOCKER_READ_LIMIT" "$WTREE_TMP/info" info --format '{{.NCPU}}{{"\t"}}{{.MemTotal}}' >/dev/null 2>&1 &
+  info_pid=$!
+  if [[ -n $LIST_ALL_IDS ]]; then
+    # shellcheck disable=SC2086
+    read_docker_status "$DOCKER_READ_LIMIT" "$WTREE_TMP/inspect" inspect --format '{{.Id}}{{"\t"}}{{.State.StartedAt}}{{"\t"}}{{.State.FinishedAt}}' $LIST_ALL_IDS >/dev/null 2>&1 &
+    inspect_pid=$!
+  fi
+  wait "$stats_pid" || true
+  wait "$info_pid" || true
+  if [[ -n $inspect_pid ]]; then wait "$inspect_pid" || true; fi
+
+  : >"$WTREE_TMP/ids"
+  for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+    for id in ${SP_IDS[k]}; do printf '%s\t%d\n' "$id" "$k" >>"$WTREE_TMP/ids"; done
+  done
+  if [[ -f $WTREE_TMP/stats ]]; then
+    local cpu_total=0 mem_total=0
+    while IFS=$'\t' read -r kind a b c d; do
+      case $kind in
+        T)
+          cpu_total=$a
+          mem_total=$b
+          ;;
+        S)
+          [[ -n ${SP_KIND[a]} ]] || continue
+          jb_new
+          jb_s project "${SP_NAME[a]}"
+          jb_n cpu_pct "$b"
+          jb_n mem_bytes "$c"
+          jb_r containers "[$d]"
+          jb_obj
+          list_emit stack_stats "$J" stack_stats flat
+          ;;
+      esac
+    done < <(awk -F'\t' '
+      function bytes(s, n, u) {
+        n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
+        return n * (u == "KiB" ? 1024 : u == "MiB" ? 1048576 : u == "GiB" ? 1073741824 : u == "TiB" ? 1099511627776 : u == "kB" ? 1e3 : u == "MB" ? 1e6 : u == "GB" ? 1e9 : 1)
+      }
+      FILENAME == idsf { owner[$1] = $2; next }
+      {
+        cpu = $2 + 0; split($3, m, " / "); mem = bytes(m[1])
+        allcpu += cpu; allmem += mem
+        if ($1 in owner) {
+          k = owner[$1]
+          pcpu[k] += cpu; pmem[k] += mem
+          row = sprintf("{\"id\":\"%s\",\"cpu_pct\":%.2f,\"mem_bytes\":%.0f}", $1, cpu, mem)
+          list[k] = list[k] (list[k] == "" ? "" : ",") row
+        }
+      }
+      END {
+        printf "T\t%.2f\t%.0f\n", allcpu, allmem
+        for (k in pcpu) printf "S\t%s\t%.2f\t%.0f\t%s\n", k, pcpu[k], pmem[k], list[k]
+      }' idsf="$WTREE_TMP/ids" "$WTREE_TMP/ids" "$WTREE_TMP/stats")
+    LIST_CPU=$cpu_total
+    LIST_MEM=$mem_total
+  else
+    status=$(cat "$WTREE_TMP/stats.status" 2>/dev/null) || status=1
+    list_warning stats_unavailable "docker stats did not answer, so the list has no CPU or memory."
+    LIST_CPU=''
+    LIST_MEM=''
+  fi
+  ncpu=''
+  mem=''
+  if [[ -f $WTREE_TMP/info ]]; then
+    IFS=$'\t' read -r ncpu mem <"$WTREE_TMP/info" || true
+  else
+    list_warning info_unavailable 'docker info did not answer, so the list has no engine totals.'
+  fi
+  jb_new
+  jb_n ncpu "$ncpu"
+  jb_n mem_total "$mem"
+  jb_n cpu_pct "$LIST_CPU"
+  jb_n mem_bytes "$LIST_MEM"
+  jb_obj
+  list_emit engine "$J" engine flat
+
+  if [[ -n $inspect_pid ]]; then
+    if [[ -f $WTREE_TMP/inspect ]]; then
+      list_ages
+    else
+      list_warning inspect_unavailable 'docker inspect did not answer, so the list has no ages of stacks.'
+    fi
+  fi
+  list_stage_end stats
+}
+
+# args: an ISO date of docker. Prints seconds since the epoch, or nothing.
+iso_epoch() {
+  local iso=$1
+  iso=${iso%%.*}
+  iso=${iso%Z}
+  date -u -d "${iso}Z" +%s 2>/dev/null || date -u -jf '%Y-%m-%dT%H:%M:%S' "$iso" +%s 2>/dev/null || true
+}
+
+# one event for each stack: when it last started and last stopped, from its containers
+list_ages() {
+  local k kind started finished epoch_s epoch_f now running i stale
+  now=$(date +%s)
+  while IFS=$'\t' read -r k started finished; do
+    [[ -n ${SP_KIND[k]} ]] || continue
+    epoch_s=''
+    epoch_f=''
+    if [[ -n $started && $started != 0001-* ]]; then epoch_s=$(iso_epoch "$started"); fi
+    if [[ -n $finished && $finished != 0001-* ]]; then epoch_f=$(iso_epoch "$finished"); fi
+    running=${SP_STATES[k * ${#LIST_STATES[@]}]}
+    stale=''
+    if ((running == 0)) && [[ -n $epoch_f ]] && ((now - epoch_f >= STALE_DAYS * 86400)); then stale=1; fi
+    SP_STALE[k]=$stale
+    SP_FINISHED[k]=$epoch_f
+    SP_STARTED[k]=$epoch_s
+    jb_new
+    jb_s project "${SP_NAME[k]}"
+    jb_n last_started_at "$epoch_s"
+    jb_n last_finished_at "$epoch_f"
+    jb_b running "$( ((running > 0)) && echo 1)"
+    jb_b stale "$stale"
+    jb_obj
+    list_emit stack_age "$J" stack_age flat
+  done < <(awk -F'\t' '
+    FILENAME == idsf { owner[substr($1, 1, 12)] = $2; next }
+    {
+      id = substr($1, 1, 12)
+      if (!(id in owner)) next
+      k = owner[id]
+      if ($2 > started[k]) started[k] = $2
+      if ($3 > finished[k]) finished[k] = $3
+      seen[k] = 1
+    }
+    END { for (k in seen) printf "%s\t%s\t%s\n", k, started[k], finished[k] }' idsf="$WTREE_TMP/ids" "$WTREE_TMP/ids" "$WTREE_TMP/inspect")
+}
+
+list_stage_disk() {
+  local cache k age='' refreshing='' name value images='' containers='' volumes='' build='' file line
+  list_stage_start disk
+  cache=$(cache_dir)
+  # a read, but a long one, so the caller can leave it out on a host that it must not load
+  if [[ -z $LIST_NO_REFRESH ]] && command -v docker >/dev/null 2>&1 && ((LIST_DOCKER_STATUS == 0)) && disk_is_old; then refresh_disk; fi
+  if [[ -d $cache/lock ]]; then refreshing=1; fi
+  if [[ -f $cache/disk-totals ]]; then
+    age=$(($(date +%s) - $(date -r "$cache/disk-totals" +%s)))
+  fi
+  file=$cache/disk-projects
+  if [[ -f $file ]]; then
+    for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+      [[ -n ${SP_KIND[k]} ]] || continue
+      value=$(awk -F'\t' -v p="${SP_NAME[k]}" '$1 == p { print $2; exit }' "$file")
+      [[ -n $value ]] || continue
+      SP_BYTES[k]=$value
+      jb_new
+      jb_s project "${SP_NAME[k]}"
+      jb_n bytes "$value"
+      jb_n age_s "$age"
+      jb_b refreshing "$refreshing"
+      jb_obj
+      list_emit stack_disk "$J" stack_disk flat
+    done
+  fi
+  jb_new
+  if [[ -f $cache/disk-totals ]]; then
+    while IFS=$'\t' read -r name value; do
+      value=$(printf '%s' "$value" | awk '
+        { n = $0 + 0; u = $0; sub(/^[0-9.]+/, "", u)
+          printf "%.0f", n * (u == "kB" ? 1e3 : u == "MB" ? 1e6 : u == "GB" ? 1e9 : u == "TB" ? 1e12 : 1) }')
+      case $name in
+        Images) images=$value ;;
+        Containers) containers=$value ;;
+        'Local Volumes') volumes=$value ;;
+        'Build Cache') build=$value ;;
+      esac
+    done <"$cache/disk-totals"
+  fi
+  jb_n images "$images"
+  jb_n containers "$containers"
+  jb_n volumes "$volumes"
+  jb_n build "$build"
+  jb_n age_s "$age"
+  jb_b refreshing "$refreshing"
+  jb_obj
+  list_emit disk_totals "$J" disk_totals flat
+  list_stage_end disk
+}
+
+# args: id, kind, label, tier, reasons (code and text, separated by \037, with \036 between reasons), bytes, stacks
+list_cleanup_row() {
+  local id=$1 kind=$2 label=$3 tier=$4 reasons=$5 bytes=$6 stacks=$7 out='' reason code keep
+  while [[ -n $reasons ]]; do
+    reason=${reasons%%$'\036'*}
+    if [[ $reasons == *$'\036'* ]]; then reasons=${reasons#*$'\036'}; else reasons=''; fi
+    code=${reason%%$'\037'*}
+    jb_new
+    jb_s code "$code"
+    jb_s text "${reason#*$'\037'}"
+    jb_obj
+    out+="${out:+,}$J"
+  done
+  json_lines "$stacks"
+  keep=$J
+  jb_new
+  jb_s id "$id"
+  jb_s kind "$kind"
+  jb_s label "$label"
+  jb_s tier "$tier"
+  jb_r reasons "[$out]"
+  jb_n bytes "$bytes"
+  jb_r stacks "$keep"
+  jb_obj
+  list_emit cleanup "$J" cleanup flat
+  case $tier in
+    safe) CT_SAFE=$((CT_SAFE + ${bytes:-0})) ;;
+    needs_look) CT_LOOK=$((CT_LOOK + ${bytes:-0})) ;;
+    never) CT_NEVER=$((CT_NEVER + ${bytes:-0})) ;;
+  esac
+  if [[ -z $bytes ]]; then CT_UNKNOWN=1; fi
+}
+
+# The tiers of the cleanup view, computed here because they state policy. safe means that wtree expects
+# no refusal, and each delete still has its plan. Volumes can hold the only copy of some data, and no
+# fact in the list can rule that out, so a stack with volumes never counts as safe.
+list_stage_cleanup() {
+  local i k tier reasons bytes stacks running stale_all any_stack base has_row=() dir lower volumes keep_going
+  list_stage_start cleanup
+  CT_SAFE=0
+  CT_LOOK=0
+  CT_NEVER=0
+  CT_UNKNOWN=''
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    [[ -z ${W_BARE[i]} ]] || continue
+    tier=''
+    reasons=''
+    bytes=''
+    stacks=''
+    running=0
+    stale_all=1
+    any_stack=''
+    for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+      if [[ " ${SP_OWNERS[k]:-} " == *" $i "* ]]; then
+        any_stack=1
+        stacks+="${SP_NAME[k]}"$'\n'
+        if ((SP_STATES[k * ${#LIST_STATES[@]}] > 0)); then running=1; fi
+        if [[ -z ${SP_STALE[k]} ]]; then stale_all=''; fi
+      fi
+    done
+    if [[ -n ${W_MAIN[i]} ]]; then
+      tier=never
+      reasons=$'main_checkout\037it is the main checkout'
+    elif [[ -n ${W_CURRENT[i]} ]]; then
+      tier=never
+      reasons=$'current\037you are in this worktree'
+    elif [[ -n ${W_HAS_LOCK[i]} ]]; then
+      tier=never
+      reasons=$'locked\037it is locked'
+    elif [[ -n ${W_ODD[i]} ]]; then
+      tier=never
+      reasons=$'odd_path\037wtree cannot act on this path'
+    elif [[ -n ${W_PRUNABLE[i]} || ! -d ${W_PATH[i]} ]]; then
+      tier=needs_look
+      reasons=$'missing_dir\037its directory is missing'
+    elif [[ -n ${G_UNREADABLE[i]} ]]; then
+      tier=needs_look
+      reasons=$'unreadable\037git cannot read it'
+    elif [[ -n ${G_CHANGED[i]} && ${G_CHANGED[i]} != 0 ]]; then
+      tier=needs_look
+      reasons="dirty"$'\037'"it has $(plural "${G_CHANGED[i]}" 'changed file')"
+    elif [[ ${G_HELD[i]} == no ]]; then
+      tier=needs_look
+      reasons=$'unheld_commit\037no branch or tag holds its commit'
+    elif [[ -n ${G_MERGED[i]} ]]; then
+      # 127 means no docker on this host, and so no stacks
+      if ((LIST_DOCKER_STATUS != 0 && LIST_DOCKER_STATUS != 127)); then
+        tier=needs_look
+        reasons="stacks_unknown"$'\037'"merged into ${G_MERGED[i]}, and docker cannot say if a stack runs from it"
+      elif ((running > 0)); then
+        tier=needs_look
+        reasons="merged_running"$'\037'"merged into ${G_MERGED[i]}, and a stack still runs"
+      elif [[ -n $any_stack && -z $stale_all ]]; then
+        tier=needs_look
+        reasons="merged_recent_stack"$'\037'"merged into ${G_MERGED[i]}, and a stack stopped in the last $STALE_DAYS days"
+      elif [[ -n $any_stack ]]; then
+        tier=safe
+        reasons="merged"$'\037'"merged into ${G_MERGED[i]}, and its stacks stopped $STALE_DAYS or more days ago"
+      else
+        tier=safe
+        reasons="merged"$'\037'"merged into ${G_MERGED[i]}"
+      fi
+    elif [[ -n ${G_GONE[i]} ]]; then
+      tier=needs_look
+      reasons=$'upstream_gone\037its upstream branch is gone, and git cannot tell if it was merged'
+    fi
+    [[ -n $tier ]] || continue
+    has_row[i]=1
+    # a stack in several worktrees counts its disk once
+    for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+      if [[ " ${SP_OWNERS[k]:-} " == *" $i "* && -z ${SP_COUNTED[k]} ]]; then
+        SP_COUNTED[k]=1
+        if [[ -n ${SP_BYTES[k]} ]]; then bytes=$((${bytes:-0} + SP_BYTES[k])); fi
+      fi
+    done
+    # a stack with volumes in a worktree that would be safe still needs a look, and so does a stack
+    # when docker volume ls did not answer: a count of 0 then means nothing
+    if [[ $tier == safe && -n $any_stack ]]; then
+      if [[ -z $LIST_VOLUMES_KNOWN ]]; then
+        tier=needs_look
+        reasons+=$'\036'"volumes_unknown"$'\037'"docker cannot say if its stacks have volumes"
+      else
+        for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+          if [[ " ${SP_OWNERS[k]:-} " == *" $i "* ]] && ((SP_VOLS[k] > 0)); then
+            tier=needs_look
+            reasons+=$'\036'"volumes"$'\037'"the stack ${SP_NAME[k]} has volumes"
+          fi
+        done
+      fi
+    fi
+    list_cleanup_row "worktree:${W_PATH[i]}" worktree "${W_PATH[i]##*/}" "$tier" "$reasons" "$bytes" "$stacks"
+  done
+  for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+    [[ -n ${SP_KIND[k]} ]] || continue
+    keep_going=1
+    for i in ${SP_OWNERS[k]:-}; do
+      if [[ -n ${has_row[i]-} ]]; then keep_going=''; fi
+    done
+    [[ -n $keep_going ]] || continue
+    tier=''
+    reasons=''
+    volumes=${SP_VOLS[k]}
+    case ${SP_KIND[k]} in
+      volumes)
+        tier=needs_look
+        reasons="volumes_only"$'\037'"only volumes are left, and wtree cannot tell where they came from. They can hold the only copy of their data"
+        ;;
+      gone)
+        # the repo says what the name should hold. A list of the machine knows only the directory.
+        lower=$(printf '%s' "${SP_NAME[k]}" | tr '[:upper:]' '[:lower:]')
+        if is_global; then base=${SP_DIR[k]##*/}; else base=$(basename "$(main_of "$LIST_CWD")"); fi
+        base=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+        if ((volumes > 0)); then
+          tier=needs_look
+          reasons="gone_volumes"$'\037'"its worktree is gone, and it has volumes"
+        elif [[ -z $LIST_VOLUMES_KNOWN ]]; then
+          tier=needs_look
+          reasons="volumes_unknown"$'\037'"its worktree is gone, and docker cannot say if it has volumes"
+        elif [[ -n $base && $lower == *"$base"* ]]; then
+          tier=safe
+          reasons=$'worktree_gone\037its worktree is gone'
+        else
+          tier=needs_look
+          reasons=$'worktree_gone_unnamed\037its directory is gone, and its name does not say that it was a worktree'
+        fi
+        ;;
+      *)
+        if [[ -n ${SP_STALE[k]} ]]; then
+          tier=needs_look
+          reasons="stale"$'\037'"it stopped $STALE_DAYS or more days ago"
+        fi
+        ;;
+    esac
+    [[ -n $tier ]] || continue
+    list_cleanup_row "stack:${SP_NAME[k]}" stack "${SP_NAME[k]}" "$tier" "$reasons" "${SP_BYTES[k]}" ''
+  done
+  jb_new
+  jb_n safe "$CT_SAFE"
+  jb_n needs_look "$CT_LOOK"
+  jb_n never "$CT_NEVER"
+  jb_b unknown "$CT_UNKNOWN"
+  jb_obj
+  list_emit cleanup_totals "$J" cleanup_totals flat
+  list_stage_end cleanup
+}
+
+# one array of a document, from its file
+doc_array() {
+  local file=$WTREE_TMP/doc.$1 line out=''
+  if [[ -f $file ]]; then
+    while IFS= read -r line; do out+="${out:+,}$line"; done <"$file"
+  fi
+  printf '[%s]' "$out"
+}
+
+doc_single() {
+  local file=$WTREE_TMP/doc.$1
+  if [[ -f $file ]]; then head -n 1 "$file" | tr -d '\n'; else printf 'null'; fi
+}
+
+core_list() {
+  local cwd='' stage
+  LIST_STREAM=''
+  LIST_ONLY=structure,git,stats,disk,cleanup
+  LIST_NO_REFRESH=''
+  while (($# > 0)); do
+    case $1 in
+      --global) export WTREE_GLOBAL=1 ;;
+      --stream) LIST_STREAM=1 ;;
+      --no-refresh) LIST_NO_REFRESH=1 ;;
+      --cwd | --only)
+        (($# >= 2)) || core_die usage "$1 needs a value"
+        if [[ $1 == --cwd ]]; then cwd=$2; else LIST_ONLY=$2; fi
+        shift
+        ;;
+      *) core_die usage "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  # a typo must not drop a stage without a word
+  stage=$LIST_ONLY,
+  while [[ -n $stage ]]; do
+    case ${stage%%,*} in
+      structure | git | stats | disk | cleanup) ;;
+      *) core_die usage "--only takes structure, git, stats, disk and cleanup" ;;
+    esac
+    stage=${stage#*,}
+  done
+  core_enter_cwd "$cwd"
+  LIST_CWD=$(pwd -P 2>/dev/null) || LIST_CWD=$PWD
+  if ! is_global && ! limited "$GIT_QUICK_LIMIT" git rev-parse --git-dir >/dev/null 2>&1; then core_die not_a_repo "not a git repository: $LIST_CWD"; fi
+  WTREE_TMP=$(mktemp -d 2>/dev/null) || core_die internal "wtree cannot make a temporary directory in ${TMPDIR:-/tmp}"
+  WTREE_TMP_OWNER=${BASHPID:-}
+  trap '[[ ${BASHPID:-} != "$WTREE_TMP_OWNER" ]] || rm -rf "$WTREE_TMP"' EXIT
+  R_COMMON=()
+  W_PATH=()
+  W_REAL=()
+  SP_NAME=()
+  LIST_ALL_IDS=''
+  LIST_ODD_ROWS=0
+  LIST_VOLUMES_KNOWN=''
+  now_ms
+  local started=$NOW_MS
+  list_stage_structure
+  if list_stage_on git; then list_stage_git; fi
+  if list_stage_on stats; then list_stage_stats; fi
+  if list_stage_on disk; then list_stage_disk; fi
+  if list_stage_on cleanup && list_stage_on git; then list_stage_cleanup; fi
+  now_ms
+  if [[ -n $LIST_STREAM ]]; then
+    printf '{"v":1,"event":"end","ms":%d}\n' "$((NOW_MS - started))"
+  else
+    printf '{"v":1,"repos":%s,"worktrees":%s,"stacks":%s,"worktree_git":%s,"stack_stats":%s,"stack_age":%s,"stack_disk":%s,"engine":%s,"disk_totals":%s,"cleanup":%s,"cleanup_totals":%s,"warnings":%s}\n' \
+      "$(doc_array repos)" "$(doc_array worktrees)" "$(doc_array stacks)" "$(doc_array worktree_git)" "$(doc_array stack_stats)" "$(doc_array stack_age)" "$(doc_array stack_disk)" \
+      "$(doc_single engine)" "$(doc_single disk_totals)" "$(doc_array cleanup)" "$(doc_single cleanup_totals)" "$(doc_array warnings)"
+  fi
+}
+
+core_main() {
+  local sub=${1:-}
+  if (($#)); then shift; fi
+  WTREE_LC_ALL_WAS_SET=${LC_ALL+1}
+  WTREE_LC_ALL_WAS=${LC_ALL:-}
+  # one character is one byte in json_set, and the output of git and docker does not change with the
+  # language of the user. The steps get the locale of the user again.
+  export LC_ALL=C
+  case $sub in
+    version)
+      (($# == 0)) || core_die usage "unknown argument: $1"
+      jb_new
+      jb_n v 1
+      jb_s script "$WTREE_VERSION"
+      jb_n contract "$CORE_CONTRACT"
+      jb_obj
+      printf '%s\n' "$J"
+      ;;
+    list) core_list "$@" ;;
+    plan) core_plan "$@" ;;
+    apply) core_apply "$@" ;;
+    open) core_open "$@" ;;
+    new) core_new "$@" ;;
+    json-str)
+      # for the tests of json_str: one JSON string on each line
+      while (($# > 0)); do
+        json_str "$1"
+        printf '\n'
+        shift
+      done
+      ;;
+    *) core_die usage "unknown core command: ${sub:-none}. Use version, list, plan, apply, open or new." ;;
+  esac
+}
+
+# prints the full path of this script, through symlinks. An old macOS has no readlink -f.
+self_path() {
+  local self
+  self=$(readlink -f "$0" 2>/dev/null) || self=$0
+  [[ -n $self ]] || self=$0
+  [[ $self == /* ]] || self=$PWD/$self
+  printf '%s\n' "$self"
+}
+
+# prints the program to try: WTREE_TUI, or the file beside the script, or the one on PATH
+find_tui() {
+  local beside=${1%/*}/wtree-tui
+  if [[ -n ${WTREE_TUI:-} ]]; then
+    printf '%s\n' "$WTREE_TUI"
+  elif [[ -f $beside && -x $beside ]]; then
+    printf '%s\n' "$beside"
+  else
+    command -v wtree-tui
+  fi
+}
+
+# args: the mode, --tui, --fzf or nothing, and --rex or nothing. It starts wtree-tui and never comes
+# back, or it returns and the fzf UI runs. wtree-tui --check asks the core for its version with the
+# same code that a start uses, so a program that does not know this contract, or that cannot run on
+# this host, gives way to fzf. The answer of that check is the only thing that this reads from it.
+choose_ui() {
+  local mode=$1 asked=${2:-} rex=${3:-} ui self tui
+  case $asked in
+    --tui) ui=tui ;;
+    --fzf) ui=fzf ;;
+    *) ui=${WTREE_UI:-} ;;
+  esac
+  case $ui in
+    fzf) return 0 ;;
+    tui) ;;
+    "") [[ -t 1 ]] || return 0 ;;
+    *) die "WTREE_UI is $ui, and it can be tui or fzf" ;;
+  esac
+  self=$(self_path)
+  tui=$(find_tui "$self") || tui=
+  if [[ -z $tui ]]; then
+    [[ $ui != tui ]] || die "wtree-tui is not beside this script or on PATH. Install it, or use --fzf"
+    return 0
+  fi
+  if ! WTREE_SCRIPT=$self "$tui" --check </dev/null >/dev/null 2>&1; then
+    printf 'wtree: %s does not match this script, so wtree uses fzf. Install both from the same release.\n' "$tui" >&2
+    return 0
+  fi
+  local args=()
+  if is_global; then args+=(-g); fi
+  case $mode in -d | --docker) args+=(-d) ;; esac
+  if [[ -n $rex ]]; then args+=(--rex); fi
+  # the program can change the scope, so the core must hear the scope from its --global only
+  unset WTREE_GLOBAL
+  WTREE_SCRIPT=$self exec "$tui" ${args[@]+"${args[@]}"}
+}
+
 # bash reads a script while it runs, so load all of it before the first command
 main() {
-  local mode=''
+  local mode='' ui_flag='' rex_flag=''
+  # the machine contract never starts a UI, and it answers in JSON even outside a repo
+  if [[ ${1:-} == core ]]; then
+    shift
+    core_main "$@"
+    return
+  fi
   while (($#)); do
     case $1 in
       -g | --global) export WTREE_GLOBAL=1 ;;
@@ -1333,6 +4417,8 @@ main() {
         export WTREE_GLOBAL=1
         mode=-d
         ;;
+      --tui | --fzf) ui_flag=$1 ;;
+      --rex) rex_flag=$1 ;;
       -d | --docker | -n | --new | -h | --help)
         [[ -z $mode ]] || die "use one of -n and -d"
         mode=$1
@@ -1364,6 +4450,13 @@ main() {
       die "unknown argument: $mode"
       ;;
   esac
+
+  # ui chooser: only the modes with a list have a choice. -n, the steps that fzf calls back and core
+  # never start a UI. wtree-tui works outside a repo too: it starts in machine scope there.
+  case $mode in
+    "" | -d | --docker) choose_ui "$mode" "$ui_flag" "$rex_flag" ;;
+  esac
+  # ui chooser end
 
   if ! is_global; then
     git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $PWD"

@@ -1,0 +1,8 @@
+{"v":1,"event":"start","plan_id":"0000000000000001","steps":2}
+{"v":1,"event":"step","id":"s1","state":"running","label":"open aa"}
+{"v":1,"event":"output","id":"s1","line":"wtree: this terminal has no tab support, open this directory: /fixture/home/code/worktrees/aa"}
+{"v":1,"event":"step","id":"s1","state":"ok","ms":7}
+{"v":1,"event":"step","id":"s2","state":"running","label":"open nowhere"}
+{"v":1,"event":"output","id":"s2","line":"wtree: the directory does not exist: /fixture/home/nowhere"}
+{"v":1,"event":"step","id":"s2","state":"failed","ms":7,"status":1,"tail":["wtree: the directory does not exist: /fixture/home/nowhere"]}
+{"v":1,"event":"end","ok":1,"failed":1,"skipped":0,"disk_refresh":false,"cancelled":false}

@@ -1,0 +1,40 @@
+ wtree  ▌repo proj▐ machine   2 worktrees                                                                        ? help
+ docker is not running · r retry
+    NAME        BRANCH           GIT     STACK     CPU   MEM  DISK AGE             │ proj
+  @ proj        main                                               1h              │ ~/code/proj
+                                                                                   │ main
+  ! cleanup                                                                        │ last: init · 1h
+    alpha       merged into main                                   1h              │
+                                                                                   │ cleanup: never
+                                                                                   │ it is the main checkout
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+
+  enter open   s stop   d delete   space mark   c cleanup   / search   a actions

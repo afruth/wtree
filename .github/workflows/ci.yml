@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tui/go.mod
+          cache-dependency-path: tui/go.sum
+      - name: Install the tools of the tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux shellcheck lsof
+          # Ubuntu 24.04 ships fzf 0.44, and wtree needs 0.53 or later
+          curl -fsSL https://github.com/junegunn/fzf/releases/download/v0.67.0/fzf-0.67.0-linux_amd64.tar.gz |
+            sudo tar -xz -C /usr/local/bin fzf
+      - run: make lint
+      - run: make test

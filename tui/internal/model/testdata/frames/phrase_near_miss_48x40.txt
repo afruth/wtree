@@ -1,0 +1,40 @@
+ wtree ▌ repo ▐ machine     7 wt · 4 st · ! ~1K
+ @ proj
+   main
+ ▸ alpha                   1/2 ●
+   2.5%  200M  3.0G
+ ▸ beta                    0/1 ○
+   1K  ±2
+   gamma
+   (detached) 13563a
+   locked
+   ⚿ ✓ merged
+
+ ! cleanup
+ ▸  proj-gone              exited 0/1 ○
+      worktree gone  4h
+    proj-vols              volumes ▭
+      volumes only
+   merged
+   merged into main
+   vanished
+   directory gone
+
+
+
+
+┌─ delete stacks · 2 go · 2 stay ──────────────┐
+│ GOES                                         │
+│   pa  stack · 1 volume  data lost            │
+│   pb  stack · 1 volume  data lost            │
+│                                              │
+│ STAYS                                        │
+│   aa  worktree  choose "and their worktrees" │
+│   bb  worktree  choose "and their worktrees" │
+│                                              │
+│ deletes 2 stacks and 2 volumes · data lost   │
+│ Type "2 stacks" to delete                    │
+│ 2 stacks                                     │
+│ > 2 stack                                    │
+│ expected: 2 stacks                           │
+└──────────────────────────────────────────────┘

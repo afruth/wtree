@@ -1,0 +1,24 @@
+ wtree  ▌repo proj▐ machine   7 wt · 4 stacks · cleanup ~1K            live now
+    NAME        BRANCH            STACK         CPU   MEM   DISK
+  @ proj        main
+  ▸ alpha                         1/2          2.5%  200M   3.0G
+  ▸ beta ±                        0/1                         1K
+    gamma       (detached) 13563a
+    locked ⚿
+
+  ! cleanup
+  ▸  proj-gone  worktree gone     exited 0/1
+     proj-vols  volumes only
+    merged      merged into main
+    vanished    directory gone
+
+
+
+
+
+
+
+
+
+                                                                        disk 1m
+  enter open   s stop   d delete   space mark   a actions

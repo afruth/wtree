@@ -1,0 +1,40 @@
+ safe – · needs a look ~1K · never –     c back
+ ✓ safe
+ ▸  proj-gone              exited 0/1 ○
+      its worktree is gone  4h
+   merged
+   merged into main
+ ! needs a look            1K
+ ▸ beta                    0/1 ○
+   1K  it has 2 changed files
+    proj-vols              volumes ▭
+      volumes only · origin unknown
+   gamma
+   no branch or tag holds its commit
+   vanished
+   its directory is missing
+   never
+ @ proj
+   it is the main checkout
+   locked
+   it is locked
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   delete      mark    mark safe   actions
+     d        space        A          a

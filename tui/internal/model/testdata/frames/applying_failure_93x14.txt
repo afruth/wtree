@@ -1,0 +1,14 @@
+┌─ deleting 3 of 4 ─────────────────────────────────────────────────────────────────────────┐
+│ ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱                                                             │
+│ ×  pa                         stack     failed: volume is in use                          │
+│ ✓  pb                         stack     done                                              │
+│ ·  aa                         worktree  waiting for its stacks                            │
+│ ·  bb                         worktree  waiting for its stacks                            │
+│                                                                                           │
+│                                                                                           │
+│                                                                                           │
+│                                                                                           │
+│                                                                                           │
+│                                                                                           │
+│   L log     backspace stop                                                                │
+└───────────────────────────────────────────────────────────────────────────────────────────┘

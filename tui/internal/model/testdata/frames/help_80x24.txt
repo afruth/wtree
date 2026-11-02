@@ -1,0 +1,24 @@
+ wtree  ▌repo proj▐ machine   7 wt · 4 stacks · cleanup ~1K            live now
+    NAME        BRANCH            STACK         CPU   MEM   DISK
+  @ proj        main
+  ▸ alpha                         1/2          2.5%  200M   3.0G
+  ┌─ help · medium 80x24 · unicode · dark · hides AGE ───────────────────────┐
+  │ j k       move                       z         all open or closed        │
+  │ enter     open or jump               tab       mark                      │
+  │ a         actions of the row         A         mark all that is shown    │
+  │ space     mark                       u         unmark all                │
+  │ s         stop: nothing is running   n         new worktree              │
+  │ d         it is the main checkout    o         cycle the order           │
+  │ /         search                     p         detail panel              │
+  │ c         cleanup view               r         read everything again     │
+  │ g         repo or machine            L         log of the last batch     │
+  │ q         quit                       y         copy the path             │
+  │ J K       move by a page             backspace filter, cleanup, marks    │
+  │ h l       collapse, expand           ?         this help                 │
+  │                                                                          │
+  │ u ascii glyphs  ·  t theme  ·  ? close                                   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+                                                                        disk 1m
+  enter open   s stop   d delete   space mark   a actions

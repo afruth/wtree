@@ -1,0 +1,14 @@
+ cleanup   safe – · needs a look ~1K · never –                              STACK       DISK
+  ✓ safe
+  ▸  proj-gone  its worktree is gone                                        exited 0/1
+    merged ✓    merged into main
+  ! needs a look                                                                          1K
+  ▸ beta ±      it has 2 changed files                                      0/1           1K
+     proj-vols  volumes only · origin unknown
+    gamma       no branch or tag holds its commit
+    vanished    its directory is missing
+    never
+  @ proj        it is the main checkout
+    locked ⚿    it is locked
+
+  d delete   space mark   A mark safe   c back   a actions                live now · disk 1m

@@ -1,0 +1,20 @@
+		CPU 4%/800%  mem 400MiB/8.0GiB
+		disk: reading, ctrl-r later
+proj-alpha	<T>/home/code/worktrees/alpha	proj-alpha
+  running 2, exited 1
+  on alpha
+  CPU 3.5%  mem 300MiB  disk ?  vol 1
+  ~/code/worktrees/alpha
+proj-main	<T>/home/code/proj	proj-main
+  exited 1
+  on main
+  disk ?  vol 2
+  ~/code/proj
+proj-old	<T>/home/gone/place	proj-old
+  exited 1  worktree gone
+  disk ?  vol 0
+  ~/gone/place
+proj-unused		proj-unused
+  no containers  volumes only
+  disk ?  vol 1
+  

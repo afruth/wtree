@@ -1,0 +1,20 @@
+ wtree  ▌repo proj▐ machine   7 wt · 4 stacks      loading…
+    NAME        BRANCH       STACK         CPU   MEM   DISK
+  @ proj        main
+  ▸ alpha                    1/2             ·     ·      ·
+  ▸ beta                     0/1                          ·
+    gamma       13563a
+    locked ⚿
+    merged
+    vanished    directory g…
+
+  ! cleanup                                               ·
+  ▸  proj-gone  worktree go… exited 0/1                   ·
+     proj-vols  volumes only                              ·
+
+
+
+
+
+
+  enter open   s stop   d delete   a actions
