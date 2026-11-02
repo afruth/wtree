@@ -1,0 +1,24 @@
+ wtree  ▌repo proj▐ machine   7 wt · 4 stacks · cleanup ~1K          · live now
+    NAME        BRANCH            STACK         CPU   MEM   DISK
+  @ proj        main
+  ▸ alpha                         1/2          2.5%  200M   3.0G
+  ▸ beta ±                        0/1                         1K
+    gamma       (detached) 13563a
+    locked ⚿
+  ┌─ deleting 3 of 4 ────────────────────────────────────────────────────────┐
+  │ ▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱                                                 │
+  │ ×  pa                       stack     failed: volume is in use           │
+  │ ✓  pb                       stack     done                               │
+  │ ·  aa                       worktree  waiting for its stacks             │
+  │ ·  bb                       worktree  waiting for its stacks             │
+  │                                                                          │
+  │   L log     backspace stop                                               │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+                                                                        disk 1m
+  d delete   s stop   enter open   space mark   a actions

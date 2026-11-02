@@ -1,0 +1,40 @@
+ wtree  ▌repo proj▐ machine   7 worktrees · 4 stacks · cleanup ~1K                          live now · disk 1m · ? help
+    NAME        BRANCH            GIT     STACK     CPU   MEM  DISK AGE            │ proj-vols
+  @ proj        main                                                1h             │ volumes only
+  ▸ alpha                                 1/2      2.5%  200M  3.0G 1h             │ 1 volume
+  ▸ beta                          ±2      0/1                    1K 1h             │
+    gamma       (detached) 13563a                                   1h             │ cleanup: needs a look
+    locked                        ⚿ ✓                               1h             │ only volumes are left, and wtree
+                                                                                   │ cannot tell where they came from.
+  ! cleanup                                                                        │ They can hold the only copy of
+  ▸  proj-gone  worktree gone     exited  0/1                       4h             │ their data
+     proj-vols  volumes only                                                       │
+    merged      merged into main                                    1h             │
+    vanished    directory gone                                                     │
+                                                                                   │
+                                                                                   │
+   ┌─ delete stacks · 0 go · 1 stay ──────────────────────────────────────────┐    │
+   │ level (1) keep volumes  (2) with volumes                                 │    │
+   │                                                                          │    │
+   │ nothing goes at this level · only volumes are left                       │    │
+   │                                                                          │    │
+   │ STAYS                                                                    │    │
+   │   proj-vols      stack      only volumes are left, its volume stays      │    │
+   │                                                                          │    │
+   │                            backspace cancel    ▸ 2  choose with volumes  │    │
+   └──────────────────────────────────────────────────────────────────────────┘    │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+
+  d delete   s stop   enter open   space mark   c cleanup   / search   a actions

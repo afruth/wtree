@@ -1,0 +1,14 @@
+ wtree ▌repo proj▐ machine  2 wt  STACK           CPU   DISK
+  @ proj        main
+  ! cleanup
+    alpha       merged into main
+
+
+
+
+
+
+
+
+
+  enter open   s stop   d delete   space mark   a actions    docker is not running · r retry

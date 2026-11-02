@@ -1,0 +1,14 @@
+┌─ 2 done · 1 failed · 1 skipped ───────────────────────────────────────────────────────────┐
+│ ×  pa                         stack     failed: volume is in use                          │
+│ ✓  pb                         stack     done                                              │
+│ ·  aa                         worktree  skipped: pa failed                                │
+│ ✓  bb                         worktree  done                                              │
+│                                                                                           │
+│                                                                                           │
+│                                                                                           │
+│                                                                                           │
+│                                                                                           │
+│ what did not finish stays marked: d retries                                               │
+│ disk sizes update in the background                                                       │
+│   L log   ▸ enter back                                                                    │
+└───────────────────────────────────────────────────────────────────────────────────────────┘

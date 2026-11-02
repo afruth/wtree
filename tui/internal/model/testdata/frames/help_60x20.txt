@@ -1,0 +1,20 @@
+ wtree  ▌repo proj▐ machine   7 wt · cleanup ~1K
+  ┌─ help · medium 60x20 · unicode · dark · hides AGE ───┐
+  │ j k       move                                       │
+  │ enter     open or jump                               │
+  │ a         actions of the row                         │
+  │ space     mark                                       │
+  │ s         stop: nothing is running                   │
+  │ d         it is the main checkout                    │
+  │ /         search                                     │
+  │ c         cleanup view                               │
+  │ g         repo or machine                            │
+  │ q         quit                                       │
+  │ J K       move by a page                             │
+  │ h l       collapse, expand                           │
+  │ z         all open or closed                         │
+  │ ↓ more                                               │
+  │                                                      │
+  │ u ascii glyphs  ·  t theme  ·  ? close               │
+  └──────────────────────────────────────────────────────┘
+  enter open   s stop   d delete   a actions

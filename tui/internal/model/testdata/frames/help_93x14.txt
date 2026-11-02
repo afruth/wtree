@@ -1,0 +1,14 @@
+┌─ help · medium 93x14 · unicode · dark · hides AGE,MEM ────────────────────────────────────┐
+│ j k   move                                                                                │
+│ enter open or jump                                                                        │
+│ a     actions of the row                                                                  │
+│ space mark                                                                                │
+│ s     stop: nothing is running                                                            │
+│ d     it is the main checkout                                                             │
+│ /     search                                                                              │
+│ c     cleanup view                                                                        │
+│ g     repo or machine                                                                     │
+│ q     quit                                                                                │
+│                                                                                           │
+│ j more  ·  u ascii glyphs  ·  t theme  ·  ? close                                         │
+└───────────────────────────────────────────────────────────────────────────────────────────┘

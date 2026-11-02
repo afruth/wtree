@@ -1,0 +1,14 @@
+┌─ delete stacks · 2 go · 2 stay ───────────────────────────────────────────────────────────┐
+│ GOES                                                                                      │
+│   pa             stack · 1 volume  data lost                                              │
+│   pb             stack · 1 volume  data lost                                              │
+│ STAYS                                                                                     │
+│   aa             worktree   choose "and their worktrees"                                  │
+│   bb             worktree   choose "and their worktrees"                                  │
+│                                                                                           │
+│ deletes 2 stacks and 2 volumes · data lost                                                │
+│ Type "2 stacks" to delete                                                                 │
+│ 2 stacks                                                                                  │
+│ > 2 stack                                                                                 │
+│ expected: 2 stacks                                                                        │
+└───────────────────────────────────────────────────────────────────────────────────────────┘

@@ -1,0 +1,20 @@
+ wtree  ▌repo proj▐ machine   7 wt · cleanup ~1K
+    NAME        BRANCH       STACK         CPU   MEM   DISK
+  @ proj        main
+  ▸ alpha                    1/2          2.5%  200M   3.0G
+  ┌─ 2 done · 1 failed · 1 skipped ──────────────────────┐
+  │ ×  pa                stack     failed: volume is in  │
+  │                                use                   │
+  │ ✓  pb                stack     done                  │
+  │ ·  aa                worktree  skipped: pa failed    │
+  │ ✓  bb                worktree  done                  │
+  │                                                      │
+  │ what did not finish stays marked: d retries          │
+  │ disk sizes update in the background                  │
+  │   L log   ▸ enter back                               │
+  └──────────────────────────────────────────────────────┘
+
+
+
+                                                    disk 1m
+  d delete   s stop   enter open   a actions

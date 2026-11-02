@@ -1,0 +1,40 @@
+ wtree  ▌repo proj▐ machine   7 worktrees · 4 stacks · cleanup ~1K                          live now · disk 1m · ? help
+    NAME        BRANCH    GIT     STACK     CPU   MEM  DISK AGE                    │ alpha
+  ▸ alpha                         1/2      2.5%  200M  3.0G 1h                     │ ~/code/worktrees/alpha
+                                                                                   │ alpha
+                                                                                   │ last: more · 1h
+                                                                                   │
+                                                                                   │ STACKS
+                                                                                   │ ◐ proj-alpha
+                                                                                   │   partial 1/2 · 3.0G
+                                                                                   │
+                                                                                   │ CONTAINERS
+                                                                                   │ api  running healthy :8080
+                                                                                   │ db  exited
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+ filter: alpha · backspace clear
+  enter open   s stop   d delete   space mark   c cleanup   / search   a actions

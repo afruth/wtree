@@ -1,0 +1,40 @@
+ cleanup   safe – · needs a look ~1K · never –                                                         disk 1m · c back
+    NAME        WHY                                       GIT     STACK   DISK AGE │ proj-gone
+  ✓ safe                                                                           │ ~/nowhere
+  ▸  proj-gone  its worktree is gone                      exited  0/1          4h  │ worktree gone 0/1
+    merged      merged into main                          ✓                    1h  │ 0 volumes
+  ! needs a look                                                            1K     │
+  ▸ beta        it has 2 changed files                    ±2      0/1       1K 1h  │ cleanup: safe
+     proj-vols  volumes only · origin unknown                                      │ its worktree is gone
+    gamma       no branch or tag holds its commit                              1h  │
+    vanished    its directory is missing                                           │ CONTAINERS
+    never                                                                          │ web  exited
+  @ proj        it is the main checkout                                        1h  │
+    locked      it is locked                              ⚿ ✓                  1h  │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+
+  d delete   space mark   A mark safe   c back   / search   a actions

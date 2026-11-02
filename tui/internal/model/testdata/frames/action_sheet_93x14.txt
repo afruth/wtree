@@ -1,0 +1,14 @@
+ wtree ▌repo proj▐ machine  7 wt·4 st·clean ~1K  STACK           CPU   DISK
+                          ┌─ alpha ───────────────────────────────┐
+                          │ 1 open         ~/code/worktrees/alpha │
+                          │ 2 stop its stacks           1 running │
+                          │ 3 delete worktree  stacks stay (3.0G) │
+                          │ 4 expand                      1 stack │
+                          │ 5 mark                       0 marked │
+                          │ 6 copy path    ~/code/worktrees/alpha │
+                          │ 7 new worktree                in proj │
+                          │ 8 print path and quit                 │
+                          │ 0 cancel                              │
+                          └───────────────────────────────────────┘
+
+  enter open   s stop   d delete   space mark   a actions                 live now · disk 1m

@@ -1,0 +1,40 @@
+ wtree  ▌repo proj▐ machine   7 worktrees · 4 stacks · cleanup ~1K                          live now · disk 1m · ? help
+    NAME        BRANCH            GIT     STACK     CPU   MEM  DISK AGE            │ proj
+  @ proj        main                                                1h             │ ~/code/proj
+  ▸ alpha                                 1/2      2.5%  200M  3.0G 1h             │ main
+  ▸ beta                          ±2      0/1                    1K 1h             │ last: init · 1h
+    gamma       (detached) 13563a                                   1h             │
+    locked                        ⚿ ✓                               1h             │ cleanup: never
+                                                                                   │ it is the main checkout
+  ! cleanup                                                                        │
+  ▸  proj-gone  worktree gone     exited  0/1                       4h             │
+     proj-vols  volumes only                                                       │
+    merged      merged into main                                    1h             │
+    vanished    directory gone                                                     │
+                                                                                   │
+    ┌─ help · wide 120x40 · unicode · dark ────────────────────────────────────────────────────────────────────────┐
+    │ j k       move                      g         repo or machine           n         new worktree               │
+    │ enter     open or jump              q         quit                      o         cycle the order            │
+    │ a         actions of the row        J K       move by a page            p         detail panel               │
+    │ space     mark                      h l       collapse, expand          r         read everything again      │
+    │ s         stop: nothing is running  z         all open or closed        L         log of the last batch      │
+    │ d         it is the main checkout   tab       mark                      y         copy the path              │
+    │ /         search                    A         mark all that is shown    backspace filter, cleanup, marks     │
+    │ c         cleanup view              u         unmark all                ?         this help                  │
+    │                                                                                                              │
+    │ u ascii glyphs  ·  t theme  ·  ? close                                                                       │
+    └──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+                                                                                   │
+
+  enter open   s stop   d delete   space mark   c cleanup   / search   a actions

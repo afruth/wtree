@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# A fake docker. It denies by default and it never starts the real one: it answers from the
+# fixture files in WTREE_SHIM_DIR, and it refuses all else with exit 125.
+#
+#   containers  project, working dir, state, id, cpu, memory (tab separated). <TAB> in the working dir
+#               stands for a tab in its name
+#   volumes     volume, project (tab separated)
+#   known       projects that existed, because a label query on an empty project is still valid
+#   meta        container id, service, status, ports, started at, finished at, name (tab separated).
+#               Without a row, a container gets plain values
+#   inject      glob, then fail, delay, hang, wedge or fail_from, then a value (tab separated). wedge
+#               also ignores TERM, and fail_from fails from that call of the glob on
+#   docker.log  each call, one line
+#   calls.ctx   the directory, COMPOSE_FILE and the call, tab separated
+#   refused     each refused call
+set -u
+
+SHIM_ID=wtree-test-docker-shim
+DIR=${WTREE_SHIM_DIR:-}
+CALL="$*"
+
+refuse() {
+  if [[ -n $DIR ]]; then printf '%s\n' "$CALL" >>"$DIR/refused"; fi
+  printf 'docker shim: refused: %s\n' "$CALL" >&2
+  exit 125
+}
+
+# a trap and wait, so that a kill also ends the sleep and frees the stdout pipe
+pause_for() {
+  sleep "$1" </dev/null >/dev/null 2>&1 &
+  local sleeper=$!
+  trap 'kill "$sleeper" 2>/dev/null; exit 143' TERM INT HUP
+  wait "$sleeper"
+  trap - TERM INT HUP
+}
+
+apply_injections() {
+  local glob kind value
+  [[ -f $DIR/inject ]] || return 0
+  while IFS=$'\t' read -r glob kind value; do
+    # shellcheck disable=SC2053
+    [[ $CALL == $glob ]] || continue
+    case $kind in
+      fail)
+        printf '%s\n' "$value" >&2
+        exit 1
+        ;;
+      delay) pause_for "$value" ;;
+      hang)
+        pause_for "$value"
+        exit 1
+        ;;
+      wedge)
+        trap '' TERM
+        sleep "$value" </dev/null >/dev/null 2>&1
+        exit 1
+        ;;
+      fail_from)
+        printf '%s\n' "$glob" >>"$DIR/inject.count"
+        if (($(grep -Fxc -- "$glob" "$DIR/inject.count") >= value)); then
+          printf 'injected failure\n' >&2
+          exit 1
+        fi
+        ;;
+    esac
+  done <"$DIR/inject"
+}
+
+is_known_project() {
+  grep -Fxqs -- "$1" "$DIR/known" && return 0
+  awk -F'\t' -v p="$1" '$1 == p { found = 1 } END { exit !found }' "$DIR/containers" && return 0
+  awk -F'\t' -v p="$1" '$2 == p { found = 1 } END { exit !found }' "$DIR/volumes"
+}
+
+render() {
+  local out=$1
+  shift
+  while (($#)); do
+    out=${out//"$1"/"$2"}
+    shift 2
+  done
+  out=${out//'\t'/$'\t'}
+  [[ $out != *'{{'* ]] || refuse
+  printf '%s\n' "$out"
+}
+
+project_label='{{.Label "com.docker.compose.project"}}'
+dir_label='{{.Label "com.docker.compose.project.working_dir"}}'
+service_label='{{.Label "com.docker.compose.service"}}'
+
+# the rows of a fixture with empty fields kept: a tab is a separator that read joins, and \037 is not
+rows() {
+  tr '\t' '\037' <"$1"
+}
+
+# sets META_* from the meta file, or to plain values for the state
+read_meta() {
+  local id=$1 project=$2 state=$3 row='' want
+  META_SERVICE=app
+  META_NAME=$project-app-$id
+  META_PORTS=
+  # a container starts once: a second read in the next second must not change the order of the rows
+  if [[ ! -f $WTREE_SHIM_DIR/started.$id ]]; then date -u +%Y-%m-%dT%H:%M:%S.000000000Z >"$WTREE_SHIM_DIR/started.$id"; fi
+  META_STARTED=$(<"$WTREE_SHIM_DIR/started.$id")
+  META_FINISHED=0001-01-01T00:00:00Z
+  case $state in
+    running) META_STATUS='Up 1 hour' ;;
+    *)
+      META_STATUS='Exited (0) 1 minute ago'
+      META_FINISHED=$META_STARTED
+      ;;
+  esac
+  [[ -f $DIR/meta ]] || return 0
+  while IFS=$'\037' read -r want row; do
+    [[ $want == "$id" ]] || continue
+    IFS=$'\037' read -r META_SERVICE META_STATUS META_PORTS META_STARTED META_FINISHED META_NAME <<<"$row"
+    return 0
+  done < <(rows "$DIR/meta")
+}
+
+do_ps() {
+  local format='' project dir state id cpu mem all='' filtered=''
+  while (($#)); do
+    case $1 in
+      -a) all=1 ;;
+      --filter) [[ ${2:-} == label=com.docker.compose.project ]] || refuse; filtered=1; shift ;;
+      --format) format=${2:-}; shift ;;
+      *) refuse ;;
+    esac
+    shift
+  done
+  [[ -n $format && -n $all && -n $filtered ]] || refuse
+  while IFS=$'\037' read -r project dir state id cpu mem; do
+    read_meta "$id" "$project" "$state"
+    dir=${dir//'<TAB>'/$'\t'}
+    render "$format" "$project_label" "$project" "$dir_label" "$dir" '{{.State}}' "$state" '{{.ID}}' "$id" \
+      "$service_label" "$META_SERVICE" '{{.Names}}' "$META_NAME" '{{.Status}}' "$META_STATUS" '{{.Ports}}' "$META_PORTS"
+  done < <(rows "$DIR/containers")
+}
+
+do_stats() {
+  local format='' project dir state id cpu mem
+  while (($#)); do
+    case $1 in
+      --no-stream) ;;
+      --format) format=${2:-}; shift ;;
+      *) refuse ;;
+    esac
+    shift
+  done
+  [[ -n $format ]] || refuse
+  while IFS=$'\037' read -r project dir state id cpu mem; do
+    [[ $state == running ]] || continue
+    render "$format" '{{.ID}}' "$id" '{{.CPUPerc}}' "$cpu%" '{{.MemUsage}}' "$mem / 8GiB"
+  done < <(rows "$DIR/containers")
+}
+
+do_volume_ls() {
+  local quiet='' format='' want='' any='' name project
+  while (($#)); do
+    case $1 in
+      -q) quiet=1 ;;
+      --format) format=${2:-}; shift ;;
+      --filter)
+        case ${2:-} in
+          label=com.docker.compose.project) any=1 ;;
+          label=com.docker.compose.project=?*) want=${2#label=com.docker.compose.project=} ;;
+          *) refuse ;;
+        esac
+        shift
+        ;;
+      *) refuse ;;
+    esac
+    shift
+  done
+  [[ -n $any || -n $want ]] || refuse
+  [[ -n $quiet || -n $format ]] || refuse
+  if [[ -n $want ]]; then is_known_project "$want" || refuse; fi
+  while IFS=$'\t' read -r name project; do
+    [[ -z $want || $project == "$want" ]] || continue
+    if [[ -n $quiet ]]; then
+      printf '%s\n' "$name"
+    else
+      render "$format" "$project_label" "$project"
+    fi
+  done <"$DIR/volumes"
+}
+
+do_volume_rm() {
+  (($# == 1)) || refuse
+  awk -F'\t' -v v="$1" '$1 == v { found = 1 } END { exit !found }' "$DIR/volumes" || refuse
+  awk -F'\t' -v v="$1" '$1 == v { print $2 }' "$DIR/volumes" >>"$DIR/known"
+  awk -F'\t' -v v="$1" '$1 != v' "$DIR/volumes" >"$DIR/volumes.new"
+  mv "$DIR/volumes.new" "$DIR/volumes"
+}
+
+do_info() {
+  case $* in
+    '') printf 'fixture engine\n' ;;
+    '--format {{.NCPU}}') printf '8\n' ;;
+    '--format {{.MemTotal}}') printf '8589934592\n' ;;
+    '--format {{.NCPU}}{{"\t"}}{{.MemTotal}}') printf '8\t8589934592\n' ;;
+    *) refuse ;;
+  esac
+}
+
+# only the one format that wtree uses, and only the ids of the fixture
+do_inspect() {
+  local id project dir state rest found
+  [[ ${1:-} == --format && ${2:-} == '{{.Id}}{{"\t"}}{{.State.StartedAt}}{{"\t"}}{{.State.FinishedAt}}' ]] || refuse
+  shift 2
+  (($# > 0)) || refuse
+  for id in "$@"; do
+    found=''
+    while IFS=$'\037' read -r project dir state rest; do
+      [[ $rest == "$id"$'\037'* ]] || continue
+      found=1
+      read_meta "$id" "$project" "$state"
+      printf '%s\t%s\t%s\n' "$id" "$META_STARTED" "$META_FINISHED"
+    done < <(rows "$DIR/containers")
+    [[ -n $found ]] || refuse
+  done
+}
+
+do_system_df() {
+  local volumes='{{range .Volumes}}{{.Labels}}\t{{.Size}}\n{{end}}{{range .Containers}}{{.Labels}}\t{{.Size}}\n{{end}}'
+  case $* in
+    "-v --format $volumes")
+      awk -F'\t' '{ printf "com.docker.compose.project=%s,other=x\t1.5GB\n", $2 }' "$DIR/volumes"
+      awk -F'\t' '{ printf "com.docker.compose.project=%s,other=x\t500MB\n", $1 }' "$DIR/containers"
+      ;;
+    '--format {{.Type}}\t{{.Size}}')
+      printf 'Images\t10.5GB\nContainers\t1.2GB\nLocal Volumes\t5GB\nBuild Cache\t200MB\n'
+      ;;
+    *) refuse ;;
+  esac
+}
+
+do_compose() {
+  (($# == 3)) || refuse
+  [[ $1 == -p ]] || refuse
+  is_known_project "$2" || refuse
+  printf '%s\n' "$2" >>"$DIR/known"
+  case $3 in
+    down)
+      awk -F'\t' -v p="$2" '$1 != p' "$DIR/containers" >"$DIR/containers.new"
+      ;;
+    stop)
+      awk -F'\t' -v OFS='\t' -v p="$2" '$1 == p { $3 = "exited" } { print }' "$DIR/containers" >"$DIR/containers.new"
+      ;;
+    *) refuse ;;
+  esac
+  mv "$DIR/containers.new" "$DIR/containers"
+}
+
+if [[ $CALL == --wtree-shim-id ]]; then
+  printf '%s\n' "$SHIM_ID"
+  exit 0
+fi
+[[ -n $DIR && -f $DIR/containers && -f $DIR/volumes ]] || refuse
+
+printf '%s\n' "$CALL" >>"$DIR/docker.log"
+printf '%s\t%s\t%s\n' "$PWD" "${COMPOSE_FILE-<unset>}" "$CALL" >>"$DIR/calls.ctx"
+apply_injections
+
+command=${1:-}
+sub=${2:-}
+case $command in
+  ps) shift; do_ps "$@" ;;
+  stats) shift; do_stats "$@" ;;
+  info) shift; do_info "$@" ;;
+  inspect) shift; do_inspect "$@" ;;
+  volume)
+    shift 2 || refuse
+    case $sub in
+      ls) do_volume_ls "$@" ;;
+      rm) do_volume_rm "$@" ;;
+      *) refuse ;;
+    esac
+    ;;
+  system)
+    [[ $sub == df ]] || refuse
+    shift 2
+    do_system_df "$@"
+    ;;
+  compose)
+    shift
+    do_compose "$@"
+    ;;
+  *) refuse ;;
+esac

@@ -1,0 +1,21 @@
+{"v":1,"event":"stage","stage":"structure"}
+{"v":1,"event":"repo","repo":{"common":"/fixture/home/code/proj/.git","name":"proj","main":"/fixture/home/code/proj","default_branch":"main"}}
+{"v":1,"event":"worktree","worktree":{"path":"/fixture/home/code/proj","common":"/fixture/home/code/proj/.git","repo":"proj","main":true,"branch":"main","detached":false,"head":"5acaca259fb1fc954337f59052cc45613d17743d","missing":false,"bare":false,"locked":null,"current":true,"odd":false}}
+{"v":1,"event":"worktree","worktree":{"path":"/fixture/home/code/worktrees/alpha","common":"/fixture/home/code/proj/.git","repo":"proj","main":false,"branch":"alpha","detached":false,"head":"5acaca259fb1fc954337f59052cc45613d17743d","missing":false,"bare":false,"locked":null,"current":false,"odd":false}}
+{"v":1,"event":"warning","code":"docker_down","message":"Docker is not running, so the list has no stacks."}
+{"v":1,"event":"stage","stage":"structure","done":true,"ms":7}
+{"v":1,"event":"stage","stage":"git"}
+{"v":1,"event":"worktree_git","path":"/fixture/home/code/proj","missing":false,"changed":0,"untracked":0,"upstream":null,"upstream_gone":false,"ahead":null,"behind":null,"last_commit_at":1767323045,"last_commit_subject":"init","index_mtime":1767323045,"merged_into":null,"head_held":true,"unreadable":false,"timed_out":false}
+{"v":1,"event":"worktree_git","path":"/fixture/home/code/worktrees/alpha","missing":false,"changed":0,"untracked":0,"upstream":null,"upstream_gone":false,"ahead":null,"behind":null,"last_commit_at":1767323045,"last_commit_subject":"init","index_mtime":1767323045,"merged_into":"main","head_held":true,"unreadable":false,"timed_out":false}
+{"v":1,"event":"stage","stage":"git","done":true,"ms":7}
+{"v":1,"event":"stage","stage":"stats"}
+{"v":1,"event":"stage","stage":"stats","done":true,"ms":7}
+{"v":1,"event":"stage","stage":"disk"}
+{"v":1,"event":"disk_totals","images":null,"containers":null,"volumes":null,"build":null,"age_s":null,"refreshing":false}
+{"v":1,"event":"stage","stage":"disk","done":true,"ms":7}
+{"v":1,"event":"stage","stage":"cleanup"}
+{"v":1,"event":"cleanup","id":"worktree:/fixture/home/code/proj","kind":"worktree","label":"proj","tier":"never","reasons":[{"code":"main_checkout","text":"it is the main checkout"}],"bytes":null,"stacks":[]}
+{"v":1,"event":"cleanup","id":"worktree:/fixture/home/code/worktrees/alpha","kind":"worktree","label":"alpha","tier":"needs_look","reasons":[{"code":"stacks_unknown","text":"merged into main, and docker cannot say if a stack runs from it"}],"bytes":null,"stacks":[]}
+{"v":1,"event":"cleanup_totals","safe":0,"needs_look":0,"never":0,"unknown":true}
+{"v":1,"event":"stage","stage":"cleanup","done":true,"ms":7}
+{"v":1,"event":"end","ms":7}

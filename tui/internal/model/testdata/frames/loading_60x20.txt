@@ -1,0 +1,20 @@
+ wtree  ▌ repo ▐ machine                           loading…
+    NAME        BRANCH    STACK         CPU   MEM   DISK
+   loading worktrees…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  enter open   s stop   d delete   a actions

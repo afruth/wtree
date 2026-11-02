@@ -1,0 +1,14 @@
+<T>/home/code/proj	<T>/home/code/proj/.git	proj
+  main
+  ~/code/proj
+  docker: proj-main 0/1 up
+<T>/home/code/worktrees/alpha	<T>/home/code/proj/.git	alpha
+  alpha
+  ~/code/worktrees/alpha
+  docker: proj-alpha 2/3 up
+<T>/home/code/worktrees/detached	<T>/home/code/proj/.git	detached
+  (detached)
+  ~/code/worktrees/detached
+<T>/home/code/worktrees/lost	<T>/home/code/proj/.git	lost
+  lost
+  ~/code/worktrees/lost [missing]

@@ -1,0 +1,14 @@
+ wtree ▌repo foundry▐ machine  7 wt·5 st·5.6G  STACK           CPU   DISK                    
+  @ feat-login ±   feat/login                  1/3            4.1%   1.2G                    
+  ▾  feat-login-api                            partial 1/2    4.1%   840M                    
+       api                                     running        3.9%                           
+       db                                      exited                                        
+     feat-login-e2e                            exited 0/1            380M                    
+  ⌂ main                                       1/1 up        12.0%   3.1G                    
+    fix-race ↑     (detached) 9ac1e2                                                         
+  ▸ pricing-v2 ±   feat/pricing-v2             1/1 up         1.2%   900M                    
+    hotfix-1 ✓                                                                               
+  ! cleanup                                                          5.6G                    
+  ▸  old-spike     worktree gone               exited 0/2            5.2G                    
+     foundry-demo  volumes only                                      380M                    
+ [enter open] [s stop] [d delete] [space mark] [a actions]        live 2s · disk 18m         

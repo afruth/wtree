@@ -1,0 +1,23 @@
+ wtree ▌ repo ▐ machine     7 wt · 4 st · ! ~1K
+ @ proj
+   main
+ ▸ alpha                   1/2 ●
+   2.5%  200M  3.0G
+ ▸ beta                    0/1 ○
+   1K  ±2
+   gamma
+   (detached) 13563a
+   locked
+┌─ deleting 3 of 4 ────────────────────────────┐
+│ ▰▰▰▰▰▰▰▱▱▱▱▱▱▱                               │
+│ ×  pa stack                                  │
+│    failed: volume is in use                  │
+│ ✓  pb stack                                  │
+│    done                                      │
+│ ·  aa worktree                               │
+│    waiting for its stacks                    │
+│ ·  bb worktree                               │
+│    waiting for its stacks                    │
+│                                              │
+│   L log     backspace stop                   │
+└──────────────────────────────────────────────┘

@@ -1,0 +1,40 @@
+ wtree ▌ repo ▐ machine                    2 wt
+ docker is not running · r retry
+ @ proj
+   main
+
+ ! cleanup
+   alpha
+   merged into main
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    open       stop      delete    actions
+   enter        s          d          a

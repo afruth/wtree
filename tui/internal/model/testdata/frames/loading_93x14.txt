@@ -1,0 +1,14 @@
+ wtree ▌ repo ▐ machine    STACK           CPU   DISK
+   loading worktrees…
+
+
+
+
+
+
+
+
+
+
+
+  enter open   s stop   d delete   space mark   a actions

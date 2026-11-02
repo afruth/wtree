@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# A fake terminal CLI: rex, tmux, zellij and others link here. It denies by default, so that no
+# test can reach a live server. It answers only from the rules that a test writes.
+#
+#   term.rules  tool, glob, exit code, stdout with \n escapes (tab separated)
+#   term.log    the tool and its arguments, one line for each call
+#   refused     each refused call
+set -u
+
+TOOL=${0##*/}
+DIR=${WTREE_SHIM_DIR:-}
+CALL="$*"
+
+if [[ $CALL == --wtree-shim-id ]]; then
+  printf 'wtree-test-%s-shim\n' "$TOOL"
+  exit 0
+fi
+
+refuse() {
+  if [[ -n $DIR ]]; then printf '%s %s\n' "$TOOL" "$CALL" >>"$DIR/refused"; fi
+  printf '%s shim: refused: %s\n' "$TOOL" "$CALL" >&2
+  exit 125
+}
+
+[[ -n $DIR ]] || refuse
+printf '%s %s\n' "$TOOL" "$CALL" >>"$DIR/term.log"
+[[ -f $DIR/term.rules ]] || refuse
+while IFS=$'\t' read -r tool glob code text; do
+  [[ $tool == "$TOOL" ]] || continue
+  # shellcheck disable=SC2053
+  [[ $CALL == $glob ]] || continue
+  printf '%b' "$text"
+  exit "$code"
+done <"$DIR/term.rules"
+refuse

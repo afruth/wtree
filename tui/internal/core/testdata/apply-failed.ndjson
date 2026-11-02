@@ -1,0 +1,10 @@
+{"v":1,"event":"start","plan_id":"0000000000000001","steps":4}
+{"v":1,"event":"step","id":"s1","state":"running","label":"delete stack pa"}
+{"v":1,"event":"output","id":"s1","line":"volume is in use"}
+{"v":1,"event":"step","id":"s1","state":"failed","ms":7,"status":1,"tail":["volume is in use"]}
+{"v":1,"event":"step","id":"s2","state":"running","label":"delete stack pb"}
+{"v":1,"event":"step","id":"s2","state":"ok","ms":7}
+{"v":1,"event":"step","id":"s3","state":"skipped","because":"s1"}
+{"v":1,"event":"step","id":"s4","state":"running","label":"delete worktree bb"}
+{"v":1,"event":"step","id":"s4","state":"ok","ms":7}
+{"v":1,"event":"end","ok":2,"failed":1,"skipped":1,"disk_refresh":true,"cancelled":false}

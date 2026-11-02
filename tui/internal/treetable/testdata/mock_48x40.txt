@@ -1,0 +1,40 @@
+ wtree ▌repo▐ machine     7 wt · 5 st · 5.6G    
+ @ feat-login              2/3 ●                
+   4.1%  612M  1.2G  feat/login ±4              
+ ▾  feat-login-api         partial 1/2 ◐        
+      4.1%  612M  840M  2h                      
+      api                  running ●            
+        3.9%  540M  :8080 :5555                 
+      db                   exited ○             
+        1d                                      
+    feat-login-e2e         exited 0/1 ○         
+      380M  3d                                  
+ ⌂ main                    1/1 up ●             
+   12.0%  1.4G  3.1G                            
+   fix-race                                     
+   (detached) 9ac1e2 ↑1                         
+ ▸ pricing-v2              1/1 up ●             
+   1.2%  220M  900M  feat/pricing-v2 ±12        
+   hotfix-1                                     
+   ✓ merged                                     
+                                                
+ ! cleanup                 5.6G                 
+ ▸  old-spike              exited 0/2 ○         
+      5.2G  worktree gone  12d                  
+    foundry-demo           volumes ▭            
+      380M  volumes only  40d                   
+                                                
+                                                
+                                                
+                                                
+                                                
+                                                
+                                                
+                                                
+                                                
+                                                
+                                                
+                                                
+ live 2s · disk 18m                             
+ [ open ] [ stop ] [ delete ] [ actions ]       
+ [enter ] [  s   ] [   d    ] [   a    ]        
