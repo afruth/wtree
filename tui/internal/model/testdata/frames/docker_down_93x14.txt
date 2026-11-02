@@ -1,4 +1,4 @@
- wtree ▌repo proj▐ machine  2 wt  STACK           CPU   DISK
+ wtree  g  repo proj  machine  2 wt  STACK           CPU   DISK
   @ proj        main
   ! cleanup
     alpha       merged into main

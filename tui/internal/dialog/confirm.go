@@ -70,6 +70,9 @@ type Confirm struct {
 	Notice string // why this sheet came back: the plan went stale
 	Said   string // the answer to the last key or tap, above the buttons: a sheet covers the status line
 	Busy   bool   // a new plan is on its way
+	// BusyLevel is the level whose plan is on its way, with Busy, or -1 when the new plan is for
+	// other targets. The option shows as picked at once, and the sheet says what it waits for.
+	BusyLevel int
 
 	Typing bool
 	Typed  []string // the exact phrases so far
@@ -79,7 +82,7 @@ type Confirm struct {
 
 // NewConfirm opens a sheet on a plan with the default choice and the focus on cancel.
 func NewConfirm(req core.PlanRequest, plan core.Plan, hidden map[string]bool, volumes map[string]int) Confirm {
-	c := Confirm{Req: req, Hidden: hidden, Volumes: volumes, Part: 1, Parts: 1}
+	c := Confirm{Req: req, Hidden: hidden, Volumes: volumes, Part: 1, Parts: 1, BusyLevel: -1}
 	c.SetPlan(plan)
 	return c
 }
@@ -100,7 +103,39 @@ func (c *Confirm) SetPlan(plan core.Plan) {
 	c.Typed = nil
 	c.Wrong = ""
 	c.Busy = false
+	c.BusyLevel = -1
 	c.Scroll = 0
+}
+
+// Level is the level of the plan on the sheet: 1 for force or with volumes, else 0.
+func (c Confirm) Level() int {
+	if c.Plan.Flags.Force || c.Plan.Flags.Volumes {
+		return 1
+	}
+	return 0
+}
+
+// LevelRequest is the request of the plan at another level of this sheet: the same targets,
+// with the flag of that level. It is false on a plan without levels.
+func (c Confirm) LevelRequest(level int) (core.PlanRequest, bool) {
+	req := c.Req
+	switch c.Plan.Action {
+	case core.ActionDeleteWorktrees:
+		req.Force = level == 1
+	case core.ActionDeleteStacks:
+		req.Volumes = level == 1
+	default:
+		return req, false
+	}
+	return req, true
+}
+
+// waitingFor is the level whose plan is on its way, or -1.
+func (c Confirm) waitingFor() int {
+	if c.Busy {
+		return c.BusyLevel
+	}
+	return -1
 }
 
 // Selected is the choice that is selected, or nil on a plan with no choices.
@@ -432,7 +467,11 @@ func (c Confirm) Options() []Option {
 		if !disabled {
 			d = digit()
 		}
-		out = append(out, Option{Digit: d, IsLevel: true, Index: index, Label: label, Selected: on == force, Disabled: disabled, Reason: reason, Tone: tone})
+		selected := on == force
+		if w := c.waitingFor(); w >= 0 {
+			selected = index == w // the pick shows at once, before its plan comes
+		}
+		out = append(out, Option{Digit: d, IsLevel: true, Index: index, Label: label, Selected: selected, Disabled: disabled, Reason: reason, Tone: tone})
 	}
 	switch c.Plan.Action {
 	case core.ActionDeleteWorktrees:
@@ -965,6 +1004,9 @@ func (c Confirm) optionRows(th theme.Theme, inner int, narrow bool) []Row {
 			mark = "(" + th.G.Kept + ")"
 		}
 		text := mark + " " + o.Label
+		if o.IsLevel && o.Index == c.waitingFor() {
+			text += " " + th.G.Ellipsis
+		}
 		switch {
 		case o.Disabled && o.IsLevel && narrow:
 			return text // it stays on the row of its group, and a tap says why
@@ -1031,8 +1073,33 @@ func (c Confirm) optionRows(th theme.Theme, inner int, narrow bool) []Row {
 		}
 	}
 	emit("level", levels)
+	if w := c.waitingFor(); w >= 0 {
+		var now, next string
+		for _, o := range levels {
+			if o.Index == w {
+				next = o.Label
+			}
+			if o.Index == c.Level() {
+				now = o.Label
+			}
+		}
+		text := "Reading the " + next + " plan" + th.G.Ellipsis + " The list below is still for " + now + ". Press " + c.backKey(levels) + " to stay on " + now + "."
+		for _, line := range Wrap(text, inner-indent) {
+			rows = append(rows, textRow(strings.Repeat(" ", indent)+th.Style(theme.ToneWarn).Render(line)))
+		}
+	}
 	emit("also", choices)
 	return rows
+}
+
+// backKey names the digit of the level of the plan on the sheet.
+func (c Confirm) backKey(levels []Option) string {
+	for _, o := range levels {
+		if o.Index == c.Level() {
+			return o.Digit
+		}
+	}
+	return "1"
 }
 
 func optionAction(o Option) string {

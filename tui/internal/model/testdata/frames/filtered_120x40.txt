@@ -1,4 +1,4 @@
- wtree  ▌repo proj▐ machine   7 worktrees · 4 stacks · cleanup ~1K                          live now · disk 1m · ? help
+ wtree   g  repo proj  machine   7 worktrees · 4 stacks · cleanup ~1K                     live now · disk 1m ·  ? help
     NAME        BRANCH    GIT     STACK     CPU   MEM  DISK AGE                    │ alpha
   ▸ alpha                         1/2      2.5%  200M  3.0G 1h                     │ ~/code/worktrees/alpha
                                                                                    │ alpha

@@ -109,7 +109,13 @@ func (m *Model) tap(x, y int) tea.Cmd {
 		return nil
 	}
 	if m.planWaiting() {
-		m.cancelPlan()
+		if f := m.overlay(); f != nil {
+			if action, _ := f.Hit(x, y); action == "cancel" {
+				return m.cancelWait()
+			}
+		}
+		m.ignoredWhileWaiting = true
+		return nil
 	}
 	m.inTap = true
 	defer func() { m.inTap = false }()
@@ -128,6 +134,8 @@ func (m *Model) tap(x, y int) tea.Cmd {
 
 func (m *Model) tapBase(action string) tea.Cmd {
 	switch {
+	case action == "scope:toggle":
+		return m.setScope(!m.machine())
 	case action == "scope:repo":
 		return m.setScope(false)
 	case action == "scope:machine":

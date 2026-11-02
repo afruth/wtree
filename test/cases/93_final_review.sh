@@ -64,14 +64,15 @@ test_final_a_letter_for_the_search_does_not_answer_a_late_sheet() {
   tg_move_to alpha
   shim_delay 'ps *' 1.5
   tui_send d
-  tui_expect "backspace cancels"
+  tui_expect "Reading the plan"
+  # typed blind while the plan is read: only cancel acts, so the letters go nowhere
   tui_send /
   tui_type pro
-  sleep 2
+  tui_expect GOES
   tui_type y
-  tui_expect "/ proy"
+  tui_expect "were ignored"
   OUT=$(tui_text)
-  assert_not_contains GOES
+  assert_not_contains "/ pro"
   assert_core_count "core apply" 0
   assert_dir "$WT_A"
 }

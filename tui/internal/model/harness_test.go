@@ -219,6 +219,18 @@ func (h *harness) calls(op string) []core.FakeCall {
 	return out
 }
 
+// mildPlans are the plans without force or volumes: a sheet with levels reads the other level
+// ahead, and these are the plans that the keys asked for.
+func (h *harness) mildPlans() []core.FakeCall {
+	var out []core.FakeCall
+	for _, c := range h.calls("plan") {
+		if !hasArgs(c.Args, "--force") && !hasArgs(c.Args, "--volumes") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func (h *harness) cursorTo(id string) {
 	h.t.Helper()
 	if !h.m.table.SetCursor(id) {

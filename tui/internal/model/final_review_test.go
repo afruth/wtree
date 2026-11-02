@@ -149,7 +149,8 @@ func TestTwoTapsInARowDoNotConfirm(t *testing.T) {
 	}
 }
 
-// A sheet that comes by itself does not take what was typed for something else.
+// A sheet that comes late does not take what was typed while it was on its way: while a plan
+// is read only cancel acts, and the sheet holds its keys for a moment when it comes.
 func TestLateSheetDoesNotTakeWhatIsTyped(t *testing.T) {
 	h := newHarness(t, 120, 35).start()
 	h.cursorTo(wtAlpha)
@@ -157,7 +158,7 @@ func TestLateSheetDoesNotTakeWhatIsTyped(t *testing.T) {
 	h.pump()
 	h.rapid("y")
 	h.pump()
-	if h.m.CurrentMode() != ModeSearch || h.m.search.Value() != "proy" {
+	if h.m.CurrentMode() != ModeConfirm || h.m.search.Value() != "" {
 		t.Fatalf("mode %d, search %q\n%s", h.m.CurrentMode(), h.m.search.Value(), h.screen())
 	}
 	if len(h.calls("apply")) != 0 {
@@ -180,20 +181,33 @@ func TestBackingOutCancelsThePlan(t *testing.T) {
 	h.letGo()
 	h.rapid("d", "u", "/", "y", "y")
 	h.pump()
-	if h.m.CurrentMode() != ModeSearch || len(h.calls("apply")) != 0 {
+	if h.m.CurrentMode() != ModeConfirm || len(h.calls("apply")) != 0 {
 		t.Fatalf("mode %d, %d applies", h.m.CurrentMode(), len(h.calls("apply")))
 	}
 }
 
-func TestATapCancelsThePlan(t *testing.T) {
+// While a plan is read, a tap on the list does nothing, and the cancel button cancels.
+func TestATapWhileThePlanIsReadOnlyCancelsOnTheButton(t *testing.T) {
 	h := newHarness(t, 120, 35).start()
 	h.cursorTo(wtAlpha)
 	h.rapid("d")
-	x, y := h.findLine(" beta")
-	h.tap(x+3, y)
-	if h.m.CurrentMode() != ModeList {
-		t.Fatal("a sheet came after the user went on")
+	// taps that land before the plan comes; h.tap would let the plan in first
+	press := func(x, y int) {
+		h.send(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
+		h.send(tea.MouseReleaseMsg{X: x, Y: y, Button: tea.MouseLeft})
 	}
+	x, y := h.findLine(" beta")
+	press(x+3, y)
+	if h.m.table.Cursor() != wtAlpha || !h.m.planWaiting() {
+		t.Fatalf("a tap on the list acted while the plan was read\n%s", h.screen())
+	}
+	x, y = h.findLine("backspace cancel")
+	press(x+2, y)
+	h.pump()
+	if h.m.CurrentMode() != ModeList || h.m.planWaiting() {
+		t.Fatalf("the cancel button did not cancel\n%s", h.screen())
+	}
+	h.expect("cancelled")
 }
 
 func TestAPlanThatArrivesAloneIsHeldForAMoment(t *testing.T) {
@@ -213,10 +227,11 @@ func TestAPendingPlanSaysSo(t *testing.T) {
 		h := newHarness(t, s[0], s[1]).start()
 		h.cursorTo(wtAlpha)
 		h.rapid("d")
-		h.expect("backspace cancels")
+		h.expect("backspace cancel")
+		h.expect("Reading the plan for 1 worktree")
 		h.rapid("d", "d", "s", "n")
 		h.pump()
-		if n := len(h.calls("plan")); n != 1 {
+		if n := len(h.mildPlans()); n != 1 {
 			t.Fatalf("%d plans", n)
 		}
 		if h.m.CurrentMode() != ModeConfirm {
@@ -250,8 +265,14 @@ func TestPhraseWaitsForTheNewPlan(t *testing.T) {
 	if h.m.tree.IsMarked(stAlpha) {
 		t.Fatal("the mark goes")
 	}
-	if !hasArgs(h.calls("plan")[1].Args, "--", "proj-old") {
-		t.Fatalf("%v", h.calls("plan")[1].Args)
+	asked := false
+	for _, c := range h.calls("plan") {
+		if strings.HasSuffix(strings.Join(c.Args, " "), "-- proj-old") {
+			asked = true
+		}
+	}
+	if !asked {
+		t.Fatalf("no plan for proj-old alone: %v", h.calls("plan"))
 	}
 }
 

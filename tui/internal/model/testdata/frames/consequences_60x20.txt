@@ -1,4 +1,4 @@
- wtree  ▌repo proj▐ machine   7 wt · cleanup ~1K
+ wtree   g  repo proj  machine   7 wt · cleanup ~1K
   ┌─ delete worktrees · 2 go · 3 stay ───────────────────┐
   │ level (1) delete  (2) force                          │
   │ also  (3) worktrees only                             │

@@ -48,6 +48,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = m.onStream(msg)
 	case planMsg:
 		cmd = m.onPlan(msg)
+	case aheadMsg:
+		cmd = m.onAhead(msg)
 	case statsTickMsg:
 		m.tickArmed = false
 		cmd = m.onTick()
@@ -83,7 +85,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		panic("wtree-tui: --panic-after")
 	}
 	m.sync()
-	return m, tea.Batch(cmd, m.keepTicking(), m.keepSpinning(), m.savePrefs())
+	return m, tea.Batch(cmd, m.keepAhead(), m.keepTicking(), m.keepSpinning(), m.savePrefs())
 }
 
 func (m *Model) clearWriter() {
@@ -346,6 +348,8 @@ func (m *Model) planCmd(req core.PlanRequest, level bool) tea.Cmd {
 	m.planSeq++
 	m.planPending = true
 	m.planSheet = false
+	m.planReq = req
+	m.ignoredWhileWaiting = false
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.planCancel = cancel
 	seq, client := m.planSeq, m.client
@@ -385,8 +389,18 @@ func (m *Model) onPlan(msg planMsg) tea.Cmd {
 	if m.mode != ModeList {
 		return nil // the user went on; a plan only reads, so nothing is lost
 	}
-	return m.showPlan(msg.req, msg.plan)
+	ignored := m.ignoredWhileWaiting
+	m.ignoredWhileWaiting = false
+	cmd := m.showPlan(msg.req, msg.plan)
+	if ignored && m.mode == ModeConfirm {
+		m.sheetHold = m.o.HoldNow().Add(typedHold)
+		m.confirm.Said = "keys pressed while the plan was read were ignored"
+	}
+	return cmd
 }
+
+// typedHold is how long a sheet holds its confirm when keys came while its plan was read.
+const typedHold = time.Second
 
 func sameTargets(a, b []string) bool {
 	if len(a) != len(b) {
@@ -434,11 +448,7 @@ func (m *Model) showPlan(req core.PlanRequest, plan core.Plan) tea.Cmd {
 	if m.queueTotal > 1 {
 		c.Part, c.Parts = m.queuePart, m.queueTotal
 		if len(m.queue) > 0 {
-			noun := "stack"
-			if m.queue[0].Action == core.ActionDeleteWorktrees {
-				noun = "worktree"
-			}
-			c.Next = dialog.Plural(len(m.queue[0].Targets), noun)
+			c.Next = queueNoun(m.queue[0])
 		}
 	}
 	m.confirm = c
@@ -504,6 +514,9 @@ func (m *Model) startApply(phrases []string) tea.Cmd {
 	}
 	m.applyReq = req
 	m.progress = dialog.NewProgress(c.Plan, ch, commandLine(req))
+	if len(m.queue) > 0 {
+		m.progress.Next = queueNoun(m.queue[0]) + " " + m.th.G.Dot + " part " + itoa(m.queuePart+1) + " of " + itoa(m.queueTotal)
+	}
 	m.mode = ModeProgress
 	m.quitMenu = nil
 	m.writerKind, m.writerOn = kindApply, true
@@ -593,6 +606,7 @@ func (m *Model) onRefused(r core.RefusedEvent) tea.Cmd {
 	m.autoClose = false
 	m.armSheet() // what comes back is a sheet that nobody has read, and keys can be on their way
 	reload := m.startFullList()
+	m.dropAhead() // what was read ahead is as old as the plan that went stale
 	switch r.Code {
 	case core.RefusedPlanStale:
 		m.mode = ModeConfirm
@@ -600,7 +614,7 @@ func (m *Model) onRefused(r core.RefusedEvent) tea.Cmd {
 			m.confirm.SetPlan(*r.Plan)
 			m.confirm.Lonely = m.lonelyOf(*r.Plan)
 		} else {
-			m.confirm.Busy = true
+			m.confirm.Busy, m.confirm.BusyLevel = true, -1
 			m.confirm.Focus = dialog.FocusCancel
 			reload = tea.Batch(reload, m.planCmd(m.confirm.Req, true))
 		}
@@ -915,4 +929,57 @@ func (m *Model) applyTheme(opts theme.Options) {
 	if focused {
 		m.search.Focus()
 	}
+}
+
+// queueNoun says what a plan request acts on: "15 worktrees".
+func queueNoun(req core.PlanRequest) string {
+	noun := "stack"
+	if req.Action == core.ActionDeleteWorktrees || req.Action == core.ActionOpen {
+		noun = "worktree"
+	}
+	return dialog.Plural(len(req.Targets), noun)
+}
+
+// waitSheet says what the plan on its way is for.
+func (m *Model) waitSheet() dialog.Waiting {
+	if m.newPending {
+		return dialog.Waiting{Title: "new worktree", Text: "Reading the repo" + m.th.G.Ellipsis}
+	}
+	req := m.planReq
+	verb := map[string]string{
+		core.ActionDeleteWorktrees: "delete worktrees",
+		core.ActionDeleteStacks:    "delete stacks",
+		core.ActionStopStacks:      "stop stacks",
+		core.ActionOpen:            "open",
+	}[req.Action]
+	if verb == "" {
+		verb = "plan"
+	}
+	title := verb
+	if m.queueTotal > 1 {
+		title += " (" + itoa(m.queuePart) + "/" + itoa(m.queueTotal) + ")"
+	}
+	text := "Reading the plan for " + queueNoun(req) + m.th.G.Ellipsis
+	if req.Action == core.ActionDeleteWorktrees {
+		who := "Each one is"
+		if len(req.Targets) == 1 {
+			who = "It is"
+		}
+		text += " " + who + " checked for changed files and nested repos, which can take a while. Nothing is deleted until you confirm."
+	}
+	if m.queuePart > 1 {
+		text = "Part " + itoa(m.queuePart-1) + " is done. " + text
+	}
+	return dialog.Waiting{Title: title, Text: text}
+}
+
+// cancelWait drops the plan on its way, and says plainly when that was a part of a batch.
+func (m *Model) cancelWait() tea.Cmd {
+	text, tone := "cancelled", theme.ToneDim
+	if m.queueTotal > 1 {
+		text = "part " + itoa(m.queuePart) + " of " + itoa(m.queueTotal) + " cancelled: " + queueNoun(m.planReq) + " not deleted"
+		tone = theme.ToneWarn
+	}
+	m.cancelPlan()
+	return m.say(text, tone)
 }

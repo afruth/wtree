@@ -1,4 +1,4 @@
- wtree  ▌ repo ▐ machine                                                                              loading… · ? help
+ wtree   g   repo   machine                                                                         loading… ·  ? help
     NAME        BRANCH    GIT     STACK     CPU   MEM  DISK AGE                    │
    loading worktrees…                                                              │
                                                                                    │
