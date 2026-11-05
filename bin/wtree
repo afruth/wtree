@@ -46,6 +46,11 @@ usage: wtree       show the worktrees and stacks of this repo. Outside a repo, o
        wtree -d    start on the Docker Compose stacks of this repo, with usage
        wtree -g    show all the worktrees and stacks on this machine, in any directory
        wtree -g -d start on all the Docker Compose stacks on this machine
+       wtree --nuke    delete all that goes without force: worktrees, their stacks, and the stacks
+                       whose worktree is gone. Volumes stay. One summary, one confirmation
+       wtree --nuke -c only what the cleanup view calls safe
+       wtree --nuke -a all that force can take, with the volumes. You type "nuke" to confirm
+       wtree --nuke -g the same on this whole machine. It goes with -c and -a
 
 wtree uses the full-screen program wtree-tui when one that matches this script is beside the script
 or on PATH, and stdout is a terminal. Else it uses fzf. --tui, --fzf or WTREE_UI=tui|fzf choose one.
@@ -882,7 +887,8 @@ run_steps() {
   if [[ -t 1 ]]; then printf '\n'; else printf '%d of %d done\n' "$((finished - failed - skipped))" "$total"; fi
   if ((failed > 0)); then
     printf '%s, %d skipped.\n' "$(plural "$failed" 'step') failed" "$skipped"
-    pause
+    # after the one confirmation of --nuke, nothing waits for a key
+    if [[ -z ${NO_PAUSE:-} ]]; then pause; fi
     return 1
   fi
 }
@@ -4119,6 +4125,8 @@ list_cleanup_row() {
   jb_r stacks "$keep"
   jb_obj
   list_emit cleanup "$J" cleanup flat
+  CL_ID[${#CL_ID[@]}]=$id
+  CL_TIER[${#CL_TIER[@]}]=$tier
   case $tier in
     safe) CT_SAFE=$((CT_SAFE + ${bytes:-0})) ;;
     needs_look) CT_LOOK=$((CT_LOOK + ${bytes:-0})) ;;
@@ -4137,6 +4145,8 @@ list_stage_cleanup() {
   CT_LOOK=0
   CT_NEVER=0
   CT_UNKNOWN=''
+  CL_ID=()
+  CL_TIER=()
   for ((i = 0; i < ${#W_PATH[@]}; i++)); do
     [[ -z ${W_BARE[i]} ]] || continue
     tier=''
@@ -4387,6 +4397,313 @@ core_main() {
   esac
 }
 
+# ---- wtree --nuke: one summary, one confirmation, then all of it. It chooses the targets from the list,
+# and the plans of the delete keys decide what may go, so it has no rules of its own about safety. Each
+# plan is computed again just before it runs, and a plan that changed after the summary does not run.
+
+# the tier of a cleanup row, or nothing. arg: the id of the row
+nuke_tier() {
+  local c
+  for ((c = 0; c < ${#CL_ID[@]}; c++)); do
+    if [[ ${CL_ID[c]} == "$1" ]]; then
+      printf '%s' "${CL_TIER[c]}"
+      return 0
+    fi
+  done
+}
+
+# reads the scope like core list does, into the W_*, SP_* and CL_* arrays. Only -c needs the ages of
+# the stacks, which take the docker stats read.
+nuke_collect() {
+  local level=$1
+  LIST_STREAM=''
+  LIST_ONLY=structure,git,cleanup
+  if [[ $level == cleanup ]]; then LIST_ONLY+=,stats; fi
+  LIST_NO_REFRESH=1
+  LIST_CWD=$(pwd -P 2>/dev/null) || LIST_CWD=$PWD
+  WTREE_TMP=$(mktemp -d 2>/dev/null) || die "wtree cannot make a temporary directory in ${TMPDIR:-/tmp}"
+  WTREE_TMP_OWNER=${BASHPID:-}
+  trap '[[ ${BASHPID:-} != "$WTREE_TMP_OWNER" ]] || rm -rf "$WTREE_TMP"' EXIT
+  R_COMMON=()
+  W_PATH=()
+  W_REAL=()
+  SP_NAME=()
+  CL_ID=()
+  CL_TIER=()
+  LIST_ALL_IDS=''
+  LIST_ODD_ROWS=0
+  LIST_VOLUMES_KNOWN=''
+  list_stage_structure
+  list_stage_git
+  if list_stage_on stats; then list_stage_stats; fi
+  list_stage_cleanup
+}
+
+# sets NK_WT_PATH, NK_WT_COMMON, NK_STACKS and NK_KEPT, the count of worktrees that no level takes
+nuke_select() {
+  local level=$1 i k o tier sel=() changed=1 inside out
+  NK_WT_PATH=()
+  NK_WT_COMMON=()
+  NK_STACKS=()
+  NK_KEPT=0
+  NK_LOOK=0
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    sel[i]=''
+    [[ -z ${W_BARE[i]} ]] || continue
+    if [[ -n ${W_MAIN[i]} || -n ${W_CURRENT[i]} || -n ${W_HAS_LOCK[i]} || -n ${W_ODD[i]} ]]; then
+      NK_KEPT=$((NK_KEPT + 1))
+      continue
+    fi
+    if [[ $level == cleanup ]]; then
+      tier=$(nuke_tier "worktree:${W_PATH[i]}")
+      if [[ $tier != safe ]]; then
+        if [[ $tier == needs_look ]]; then NK_LOOK=$((NK_LOOK + 1)); fi
+        continue
+      fi
+    fi
+    sel[i]=1
+  done
+  # a stack that also runs from a worktree that stays would lose its containers there too, so a
+  # worktree that shares a stack with one that stays stays as well
+  while [[ -n $changed ]]; do
+    changed=''
+    for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+      [[ -n ${SP_KIND[k]} && -n ${SP_OWNERS[k]:-} ]] || continue
+      inside=''
+      out=''
+      for o in ${SP_OWNERS[k]}; do
+        if [[ -n ${sel[o]} ]]; then inside=1; else out=1; fi
+      done
+      if [[ -n $inside && -n $out ]]; then
+        for o in ${SP_OWNERS[k]}; do
+          if [[ -n ${sel[o]} ]]; then
+            sel[o]=''
+            NK_SHARED[${#NK_SHARED[@]}]="${W_PATH[o]##*/}: the stack ${SP_NAME[k]} also runs from a worktree that stays"
+            changed=1
+          fi
+        done
+      fi
+    done
+  done
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    if [[ -n ${sel[i]} ]]; then
+      NK_WT_PATH[${#NK_WT_PATH[@]}]=${W_PATH[i]}
+      NK_WT_COMMON[${#NK_WT_COMMON[@]}]=${W_COMMON[i]}
+    fi
+  done
+  # stacks with no worktree. The stacks of a worktree go with it, in its plan.
+  for ((k = 0; k < ${#SP_NAME[@]}; k++)); do
+    [[ -n ${SP_KIND[k]} && -z ${SP_OWNERS[k]:-} ]] || continue
+    case $level in
+      cleanup) [[ $(nuke_tier "stack:${SP_NAME[k]}") == safe ]] || continue ;;
+      smart) [[ ${SP_KIND[k]} == gone ]] || continue ;;
+      all) [[ ${SP_KIND[k]} == gone || ${SP_KIND[k]} == volumes ]] || continue ;;
+    esac
+    NK_STACKS[${#NK_STACKS[@]}]=${SP_NAME[k]}
+  done
+}
+
+nuke_plan_worktrees() {
+  local level=$1 force=''
+  if [[ $level == all ]]; then force=force; fi
+  plan_delete_worktrees "$force" "${NK_WT_PATH[@]}" "${NK_WT_COMMON[@]}"
+  NK_CHOICE=''
+  NK_VOLUME_NOTE=''
+  if ((${#CHOICE_ID[@]} > 0)); then
+    NK_CHOICE=0
+    if ((${#CHOICE_ID[@]} > 1)); then NK_CHOICE=1; fi
+    if [[ $level == all && ${#CHOICE_ID[@]} -gt 2 ]]; then
+      if [[ -n ${CHOICE_AVAILABLE[2]} ]]; then
+        NK_CHOICE=2
+      else
+        NK_VOLUME_NOTE="${CHOICE_REASON[2]}, so the volumes of these stacks stay."
+      fi
+    fi
+  fi
+  plan_fingerprint
+}
+
+nuke_plan_stacks() {
+  local level=$1 volumes=''
+  if [[ $level == all ]]; then volumes=volumes; fi
+  plan_delete_stacks "$volumes" labels "${NK_STACKS[@]}" "${NK_STACKS[@]}"
+  NK_CHOICE=''
+  if ((${#CHOICE_ID[@]} > 0)) && [[ -z $PLAN_REFUSAL ]]; then NK_CHOICE=0; fi
+  plan_fingerprint
+}
+
+# the human confirmed the whole summary once, and that confirmation answers the phrases of the plan
+nuke_authorize() {
+  local c=$1 want=${CHOICE_PHRASES[$1]} phrases=()
+  while [[ -n $want ]]; do
+    phrases[${#phrases[@]}]=${want%%$'\037'*}
+    if [[ $want == *$'\037'* ]]; then want=${want#*$'\037'}; else want=''; fi
+  done
+  plan_authorize "$c" ${phrases[@]+"${phrases[@]}"}
+}
+
+# prints the part of the summary for the worktree plan
+nuke_show_worktrees() {
+  local level=$1 c=$NK_CHOICE n=${#PW_ITEM[@]} k i
+  ((n > 0)) || return 0
+  if [[ $level == all ]]; then printf 'FORCE delete %s:\n' "$(plural "$n" 'worktree')"; else printf 'Delete %s:\n' "$(plural "$n" 'worktree')"; fi
+  for ((k = 0; k < n; k++)); do
+    i=${PW_ITEM[k]}
+    printf '  %s' "$(short_path "${ITEM_PATH[i]}")"
+    if [[ -n ${ITEM_NOTE[i]} ]]; then printf '  (%s)' "${ITEM_NOTE[i]}"; fi
+    printf '\n'
+  done
+  if ((c > 0)); then
+    if ((c == 2)); then printf 'With their stacks and the volumes of these stacks:\n'; else printf 'With their stacks. The volumes stay:\n'; fi
+    for ((k = 0; k < ${#PST_NAME[@]}; k++)); do
+      printf '  %s  (%s' "${PST_NAME[k]}" "${ITEM_LABEL[PST_OWNER[k]]}"
+      if ((c == 2)); then printf ', %s' "$(plural "${PST_VCOUNT[k]}" 'volume')"; fi
+      printf ')\n'
+      if [[ -n ${PST_ELSEWHERE[k]} ]]; then
+        while IFS= read -r i; do printf '    also runs in %s, and its containers there go too\n' "$(short_path "$i")"; done <<<"${PST_ELSEWHERE[k]}"
+      fi
+    done
+  fi
+  if [[ -n $PLAN_DOCKER_NOTE ]]; then printf '%s\n' "$PLAN_DOCKER_NOTE"; fi
+  if [[ -n $NK_VOLUME_NOTE ]]; then printf '%s\n' "$NK_VOLUME_NOTE"; fi
+  if [[ -n $PLAN_NESTED_NAME ]]; then printf 'Another git repo inside %s is deleted too, with all its commits.\n' "$(printf '%s' "$PLAN_NESTED_NAME" | tr '\037' ',')"; fi
+}
+
+# prints the part of the summary for the stacks without a worktree
+nuke_show_stacks() {
+  local level=$1 k
+  if [[ -n $PLAN_REFUSAL ]]; then
+    printf 'The stacks without a worktree stay: %s\n' "$PLAN_REFUSAL"
+    return 0
+  fi
+  ((${#PST_NAME[@]} > 0)) || return 0
+  if [[ $level == all ]]; then
+    printf 'Delete %s without a worktree, and their volumes:\n' "$(plural "${#PST_NAME[@]}" 'stack')"
+    for ((k = 0; k < ${#PST_NAME[@]}; k++)); do printf '  %s  (%s)\n' "${PST_NAME[k]}" "$(plural "${PST_VCOUNT[k]}" 'volume')"; done
+  else
+    printf 'Delete %s without a worktree. The volumes stay:\n' "$(plural "${#PST_NAME[@]}" 'stack')"
+    for ((k = 0; k < ${#PST_NAME[@]}; k++)); do printf '  %s\n' "${PST_NAME[k]}"; done
+  fi
+}
+
+# prints what stays, with the reason and the level that would take it
+nuke_show_stays() {
+  local level=$1 i hint
+  for ((i = 0; i < ${#ITEM_ID[@]}; i++)); do
+    [[ -z ${ITEM_GO[i]} && -z ${ITEM_OFFERED[i]} ]] || continue
+    hint=''
+    if [[ -n ${ITEM_FORCE_OK[i]} && $level != all ]]; then hint='. wtree --nuke -a takes it'; fi
+    if [[ ${ITEM_CODE[i]} == odd_path ]]; then
+      printf '  %s\n' "${ITEM_TEXT[i]}"
+    else
+      printf '  %s: %s%s\n' "${ITEM_LABEL[i]}" "${ITEM_TEXT[i]}" "$hint"
+    fi
+  done
+}
+
+# args: the level (cleanup, smart or all). It asks one question, and on yes it runs to the end.
+nuke() {
+  local level=$1 scope summary stays wt_id='' st_id='' wt_go=0 st_go=0 phrase='' typed='' status=0 any_volumes='' i
+  WTREE_LC_ALL_WAS_SET=${LC_ALL+1}
+  WTREE_LC_ALL_WAS=${LC_ALL:-}
+  export LC_ALL=C
+  NO_PAUSE=1
+  NK_SHARED=()
+  if is_global; then scope='this machine'; else scope="the repo $(basename "$(main_of .)")"; fi
+  case $level in
+    cleanup) printf 'wtree --nuke -c: what the cleanup view calls safe, in %s\n' "$scope" ;;
+    smart) printf 'wtree --nuke: all that goes without force, in %s. Volumes stay\n' "$scope" ;;
+    all) printf 'wtree --nuke -a: all that force can take, in %s, with volumes\n' "$scope" ;;
+  esac
+  printf 'Reading the worktrees and stacks...'
+  nuke_collect "$level"
+  nuke_select "$level"
+  printf '\r\033[K'
+  summary=''
+  stays=''
+  if ((${#NK_WT_PATH[@]} > 0)); then
+    nuke_plan_worktrees "$level"
+    wt_id=$PLAN_ID
+    wt_go=${#PW_ITEM[@]}
+    if [[ -n $NK_CHOICE ]]; then
+      summary+=$(nuke_show_worktrees "$level")$'\n'
+      if [[ ${CHOICE_CONFIRM[NK_CHOICE]} == phrase || -n ${CHOICE_VOLUMES[NK_CHOICE]} ]]; then phrase=1; fi
+      if [[ -n ${CHOICE_VOLUMES[NK_CHOICE]} ]]; then any_volumes=1; fi
+    fi
+    stays+=$(nuke_show_stays "$level")
+    NK_WT_CHOICE=$NK_CHOICE
+  fi
+  if ((${#NK_STACKS[@]} > 0)); then
+    nuke_plan_stacks "$level"
+    st_id=$PLAN_ID
+    if [[ -n $NK_CHOICE ]]; then st_go=${#PST_NAME[@]}; fi
+    if [[ -n $NK_CHOICE || -n $PLAN_REFUSAL ]]; then summary+=$(nuke_show_stacks "$level")$'\n'; fi
+    if [[ -n $NK_CHOICE && (${CHOICE_CONFIRM[NK_CHOICE]} == phrase || -n ${CHOICE_VOLUMES[NK_CHOICE]}) ]]; then phrase=1; fi
+    if [[ -n $NK_CHOICE && -n ${CHOICE_VOLUMES[NK_CHOICE]} ]]; then any_volumes=1; fi
+    NK_ST_CHOICE=$NK_CHOICE
+  fi
+  for ((i = 0; i < ${#NK_SHARED[@]}; i++)); do stays+="${stays:+$'\n'}  ${NK_SHARED[i]}"; done
+  core_restore_locale
+
+  printf '%s' "$summary"
+  if [[ -n $stays ]]; then printf 'These stay:\n%s\n' "$stays"; fi
+  if ((NK_KEPT > 0)); then printf 'No delete takes %s: main checkouts, the one you are in, locked ones.\n' "$(plural "$NK_KEPT" 'worktree')"; fi
+  if ((NK_LOOK > 0)); then printf '%s need a look first. wtree --nuke shows what it takes of them.\n' "$(plural "$NK_LOOK" 'worktree')"; fi
+  if ((wt_go + st_go == 0)); then
+    printf 'Nothing to delete.\n'
+    return 0
+  fi
+  if ((wt_go > 0)); then
+    if [[ $level == all ]]; then
+      printf 'Changed files, untracked files, ignored files, and commits that no branch or tag holds are lost.\n'
+    else
+      printf 'Ignored files, such as .env and node_modules, are deleted too.\n'
+    fi
+  fi
+  if [[ -n $any_volumes ]]; then printf 'The data in the volumes is lost.\n'; fi
+  if [[ $level == all || -n $phrase ]]; then
+    flush_input
+    printf 'Type "nuke" to delete: '
+    read -r typed </dev/tty || typed=
+    [[ $typed == nuke ]] || { printf 'Nothing was deleted.\n'; return 0; }
+  else
+    confirm 'Delete all of it?' || { printf 'Nothing was deleted.\n'; return 0; }
+  fi
+
+  if ((wt_go > 0)); then
+    export LC_ALL=C
+    nuke_plan_worktrees "$level"
+    core_restore_locale
+    if [[ $PLAN_ID != "$wt_id" || $NK_CHOICE != "$NK_WT_CHOICE" ]]; then
+      printf 'The worktrees changed after the summary, so they stay. Run wtree --nuke again.\n'
+      status=1
+    elif nuke_authorize "$NK_CHOICE"; then
+      plan_queue "$NK_CHOICE"
+      run_steps || status=1
+    else
+      printf 'wtree: the plan of the worktrees asks for more than this summary showed, so they stay.\n' >&2
+      status=1
+    fi
+  fi
+  if ((st_go > 0)); then
+    export LC_ALL=C
+    nuke_plan_stacks "$level"
+    core_restore_locale
+    if [[ $PLAN_ID != "$st_id" || $NK_CHOICE != "$NK_ST_CHOICE" ]]; then
+      printf 'The stacks without a worktree changed after the summary, so they stay. Run wtree --nuke again.\n'
+      status=1
+    elif nuke_authorize "$NK_CHOICE"; then
+      plan_queue "$NK_CHOICE"
+      run_steps || status=1
+    else
+      printf 'wtree: the plan of the stacks asks for more than this summary showed, so they stay.\n' >&2
+      status=1
+    fi
+  fi
+  refresh_disk
+  return "$status"
+}
+
 # prints the full path of this script, through symlinks. An old macOS has no readlink -f.
 self_path() {
   local self
@@ -4446,7 +4763,7 @@ choose_ui() {
 
 # bash reads a script while it runs, so load all of it before the first command
 main() {
-  local mode='' ui_flag='' rex_flag=''
+  local mode='' ui_flag='' rex_flag='' nuke_level=''
   # the machine contract never starts a UI, and it answers in JSON even outside a repo
   if [[ ${1:-} == core ]]; then
     shift
@@ -4462,8 +4779,10 @@ main() {
         ;;
       --tui | --fzf) ui_flag=$1 ;;
       --rex) rex_flag=$1 ;;
-      -d | --docker | -n | --new | -h | --help)
-        [[ -z $mode ]] || die "use one of -n and -d"
+      -c | --cleanup) nuke_level=cleanup ;;
+      -a | --all) nuke_level=all ;;
+      -d | --docker | -n | --new | -h | --help | --nuke)
+        [[ -z $mode ]] || die "use one of -n, -d and --nuke"
         mode=$1
         ;;
       *) break ;;
@@ -4476,11 +4795,13 @@ main() {
     mode=${1:-}
     if (($#)); then shift; fi
   fi
+  if [[ -n $nuke_level && $mode != --nuke ]]; then die "-c and -a go with --nuke"; fi
   case $mode in
     -h | --help)
       usage
       exit 0
       ;;
+    --nuke) ;;
     -n | --new)
       if is_global; then die "-n creates a worktree in this repo, so it does not work with -g"; fi
       ;;
@@ -4508,6 +4829,7 @@ main() {
   case $mode in
     "") pick_worktree ;;
     -n | --new) new_worktree ;;
+    --nuke) nuke "${nuke_level:-smart}" ;;
     --list) list_worktrees ;;
     --rescan)
       if is_global; then rescan_repos; fi
