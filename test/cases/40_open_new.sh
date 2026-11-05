@@ -228,7 +228,7 @@ test_cli_rejects_n_with_d() {
   make_repo
   wt -n -d
   assert_rc 1
-  assert_contains "use one of -n and -d"
+  assert_contains "use one of -n, -d and --nuke"
 }
 
 test_cli_needs_a_pair_for_each_entry() {

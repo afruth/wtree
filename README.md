@@ -40,6 +40,10 @@ To build from a checkout, you need Go 1.26 and `make install`. It installs both 
 | `wtree -g` | Show all the worktrees and stacks on this machine, in any directory |
 | `wtree -g -d` | Start with a flat list of all the stacks on this machine |
 | `wtree -n` | Create a worktree in `../worktrees/<unique-name>` at the current HEAD, with a detached HEAD, and open it. It needs no UI |
+| `wtree --nuke` | Delete all that goes without force, after one summary and one confirmation. See [Nuke](#nuke) |
+| `wtree --nuke -c` | Delete only what the cleanup view calls `safe` |
+| `wtree --nuke -a` | Delete all that force can take, with the volumes |
+| `wtree --nuke -g` | The same for the whole machine. It goes with `-c` and `-a` |
 | `wtree -h` | Show the help |
 
 The `../worktrees` directory is beside the main checkout.
@@ -51,6 +55,22 @@ WTREE_ROOTS=$HOME/code:/srv/repos wtree -g
 ```
 
 The worktrees of a repo with a stack always appear, even when the repo is outside these directories.
+
+### Nuke
+
+`wtree --nuke` deletes many entries with one confirmation. It reads the scope, chooses the targets, and shows one summary: what goes, what stays and why, and what is lost. After your yes it runs to the end, and it asks nothing more. A step that fails does not stop the others.
+
+| Level | Worktrees | Their stacks | Stacks without a worktree | Confirm |
+| - | - | - | - | - |
+| `-c` | The `safe` rows of the cleanup view | Deleted. A `safe` row has no volumes | The `safe` rows | `y` |
+| none | Each one that a delete takes without force | Deleted, the volumes stay | Stacks whose worktree is gone. The volumes stay | `y` |
+| `-a` | Each one that force can take | Deleted with their volumes | Stacks whose worktree is gone, and `volumes only` stacks, with their volumes | Type `nuke` |
+
+The rules are those of a delete from the list. No level takes the main checkout, the worktree that you are in, a locked worktree, or a stack of a worktree that stays. In machine scope, stacks in directories outside a repo stay too. A worktree that shares a stack with a worktree that stays also stays.
+
+`wtree --nuke -a` also deletes a git repo inside a worktree, with its commits. The summary names it, and your typed `nuke` confirms it.
+
+Each plan is read again just before it runs. If something changed after the summary, that part does not run. Run `wtree --nuke` again to see the new state.
 
 ## Keys
 
